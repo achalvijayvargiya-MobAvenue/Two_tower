@@ -40,6 +40,10 @@ def _parse_inference_section(i: dict, *, path_label: str) -> InferenceConfig:
         output_min_rows_per_part=int(i.get("output_min_rows_per_part", 100_000)),
         output_parquet_compression=str(i.get("output_parquet_compression", "zstd")),
         debug_cuda=bool(i.get("debug_cuda", False)),
+        max_files=int(i["max_files"]) if i.get("max_files") not in (None, "", 0) else None,
+        max_users_per_file=int(i["max_users_per_file"])
+        if i.get("max_users_per_file") not in (None, "", 0)
+        else None,
     )
 
 

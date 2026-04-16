@@ -159,6 +159,7 @@ def tt_infer_worker(
     output_compression: str,
     infer_stream_batch_rows: int,
     workers_per_gpu: int,
+    max_users_per_file: int | None,
 ) -> None:
     """Multiprocessing worker: load tower + client matrix once, consume parquet paths from ``file_queue``."""
     os.environ["POLARS_MAX_THREADS"] = "2"
@@ -279,6 +280,8 @@ def tt_infer_worker(
             pending: pl.DataFrame | None = None
 
             for batch in _iter_record_batches(dset, cols, infer_stream_batch_rows):
+                if max_users_per_file is not None and users_this_file >= int(max_users_per_file):
+                    break
                 t_read += time.time() - t0
                 t0 = time.time()
                 bpl = pl.from_arrow(batch)
@@ -293,6 +296,8 @@ def tt_infer_worker(
                 t_prep += time.time() - t0
 
                 while pending is not None and len(pending) >= rank_user_batch:
+                    if max_users_per_file is not None and users_this_file >= int(max_users_per_file):
+                        break
                     t0 = time.time()
                     chunk = _prepare_frame(
                         pending[:rank_user_batch].to_pandas(),
@@ -302,6 +307,13 @@ def tt_infer_worker(
                     )
                     pending = pending[rank_user_batch:]
                     t_prep += time.time() - t0
+
+                    if max_users_per_file is not None:
+                        remaining = int(max_users_per_file) - users_this_file
+                        if remaining <= 0:
+                            break
+                        if len(chunk) > remaining:
+                            chunk = chunk.iloc[:remaining].copy()
 
                     t0 = time.time()
                     out_df = _rank_batch_topk(
@@ -333,8 +345,14 @@ def tt_infer_worker(
                     del out_df
                     gc.collect()
                 t0 = time.time()
+                if max_users_per_file is not None and users_this_file >= int(max_users_per_file):
+                    break
 
-            if pending is not None and len(pending) > 0:
+            if (
+                pending is not None
+                and len(pending) > 0
+                and (max_users_per_file is None or users_this_file < int(max_users_per_file))
+            ):
                 t0 = time.time()
                 chunk = _prepare_frame(
                     pending.to_pandas(),
@@ -345,35 +363,43 @@ def tt_infer_worker(
                 del pending
                 t_prep += time.time() - t0
 
+                if max_users_per_file is not None:
+                    remaining = int(max_users_per_file) - users_this_file
+                    if remaining > 0 and len(chunk) > remaining:
+                        chunk = chunk.iloc[:remaining].copy()
+                    elif remaining <= 0:
+                        chunk = chunk.iloc[:0].copy()
+
                 t0 = time.time()
-                out_df = _rank_batch_topk(
-                    infer_df=chunk,
-                    device_id_col=device_id_col,
-                    user_cat_cols=user_cat_cols,
-                    user_num_cols=user_num_cols,
-                    user_multi_cols=user_multi_cols,
-                    user_vocabs=user_vocabs,
-                    user_multi_vocabs=user_multi_vocabs,
-                    multi_max_tokens=multi_max_tokens,
-                    expected_vocab_sizes=expected_vocab_sizes,
-                    expected_cat_dim=expected_cat_dim,
-                    expected_num_dim=expected_num_dim,
-                    user_tower=user_tower,
-                    client_emb_t=client_emb_t,
-                    client_ids_np=client_ids_np,
-                    topk=topk,
-                    client_chunk=client_chunk,
-                    use_amp=use_amp,
-                    amp_dtype_torch=amp_dtype_torch,
-                    to_device=to_device,
-                )
-                t_inf += time.time() - t0
-                out_buf.append(out_df)
-                out_rows += len(out_df)
-                users_this_file += len(chunk)
-                _flush()
-                del out_df
-                gc.collect()
+                if len(chunk) > 0:
+                    out_df = _rank_batch_topk(
+                        infer_df=chunk,
+                        device_id_col=device_id_col,
+                        user_cat_cols=user_cat_cols,
+                        user_num_cols=user_num_cols,
+                        user_multi_cols=user_multi_cols,
+                        user_vocabs=user_vocabs,
+                        user_multi_vocabs=user_multi_vocabs,
+                        multi_max_tokens=multi_max_tokens,
+                        expected_vocab_sizes=expected_vocab_sizes,
+                        expected_cat_dim=expected_cat_dim,
+                        expected_num_dim=expected_num_dim,
+                        user_tower=user_tower,
+                        client_emb_t=client_emb_t,
+                        client_ids_np=client_ids_np,
+                        topk=topk,
+                        client_chunk=client_chunk,
+                        use_amp=use_amp,
+                        amp_dtype_torch=amp_dtype_torch,
+                        to_device=to_device,
+                    )
+                    t_inf += time.time() - t0
+                    out_buf.append(out_df)
+                    out_rows += len(out_df)
+                    users_this_file += len(chunk)
+                    _flush()
+                    del out_df
+                    gc.collect()
 
             status_queue.put(
                 {

@@ -1,6 +1,6 @@
 paths:
-  infer: "s3://.../test_data_final/"
-  artifacts_base: "s3://.../two_tower_ml/"
+  infer: "s3://mobavenue-simplismart-aws-s3-apse-sg/rtb/data/shabbir/ml_simple_shabbir_grofers/test_data_final/"
+  artifacts_base: "s3://mobavenue-simplismart-aws-s3-apse-sg/rtb/data/two_tower_ml/"
 
 features:
   device_id_col: "device_id"
@@ -12,7 +12,7 @@ infer:
   infer_stream_batch_rows: 65536
   num_physical_gpus: 1
   workers_per_gpu: 1
-  ranking_output: "s3://.../user_client_rankings/"
+  ranking_output: "s3://mobavenue-simplismart-aws-s3-apse-sg/rtb/data/two_tower_ml/user_client_rankings/"
   rank_user_batch: 4096
   client_chunk: 8192
   use_amp: true
@@ -20,6 +20,9 @@ infer:
   output_min_rows_per_part: 100000
   output_parquet_compression: "zstd"
   debug_cuda: false
+  # Optional run-size controls for quick smoke tests (null = no limit).
+  max_files: 2
+  max_users_per_file: 5000
 
 extra: {}
 

@@ -78,6 +78,12 @@ class InferenceConfig:
     output_parquet_compression: str = "zstd"
     debug_cuda: bool = False
 
+    # Optional run-size controls for quick smoke tests.
+    # - max_files: only process first N parquet inputs under paths.infer
+    # - max_users_per_file: stop after ranking N unique users per parquet file
+    max_files: int | None = None
+    max_users_per_file: int | None = None
+
 
 @dataclass(frozen=True)
 class InferPaths:
