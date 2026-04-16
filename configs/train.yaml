@@ -1,15 +1,169 @@
 paths:
-  train: "s3://.../training_data_final/"
-  val: "s3://.../validation_data_final/"
-  infer: "s3://.../test_data_final/"
-  artifacts_base: "s3://.../two_tower_ml/"
+  train: "s3://mobavenue-simplismart-aws-s3-apse-sg/rtb/data/shabbir/ml_simple_shabbir_grofers/training_data_final/"
+  val: "s3://mobavenue-simplismart-aws-s3-apse-sg/rtb/data/shabbir/ml_simple_shabbir_grofers/validation_data_final/"
+  infer: "s3://mobavenue-simplismart-aws-s3-apse-sg/rtb/data/shabbir/ml_simple_shabbir_grofers/test_data_final/"
+  artifacts_base: "s3://mobavenue-simplismart-aws-s3-apse-sg/rtb/data/two_tower_ml/"
 
 features:
   label_col: "label"
   device_id_col: "device_id"
   client_id_col: "client_bundle_id"
-  user_feature_cols: []
-  client_feature_cols: []
+  user_feature_cols:
+    - "carrier"
+    - "os_version"
+    - "recency"
+    - "city_original"
+    - "state_original"
+    - "city_tier"
+    - "geographic_region"
+    - "is_metro"
+    - "is_capital"
+    - "is_coastal"
+    - "literacy_rate"
+    - "investments_rate"
+    - "crypto_rate"
+    - "finance_rate"
+    - "shopping_rate"
+    - "entertainment_rate"
+    - "social_rate"
+    - "education_rate"
+    - "utility_rate"
+    - "health_rate"
+    - "travel_rate"
+    - "news_rate"
+    - "food_drink_rate"
+    - "lending_rate"
+    - "quick_service_rate"
+    - "ride_rate"
+    - "gaming_action_rate"
+    - "real_money_casino_rate"
+    - "word_game_rate"
+    - "trivia_puzzle_rate"
+    - "strategy_game_rate"
+    - "sports_game_rate"
+    - "simulation_rpg_rate"
+    - "racing_game_rate"
+    - "casual_game_rate"
+    - "board_game_rate"
+    - "arcade_game_rate"
+    - "ad_type_0_rate"
+    - "ad_type_1_rate"
+    - "ad_type_2_rate"
+    - "rewarded_rate"
+    - "interstitial_rate"
+    - "distinct_score_45plus_apps"
+    - "distinct_score_40_45_apps"
+    - "distinct_score_30_40_apps"
+    - "distinct_score_below30_apps"
+    - "distinct_mainstream_apps"
+    - "distinct_popular_apps"
+    - "distinct_mid_tier_apps"
+    - "distinct_niche_apps"
+    - "distinct_new_apps"
+    - "distinct_recent_apps"
+    - "distinct_established_apps"
+    - "distinct_veteran_apps"
+    - "distinct_free_apps"
+    - "distinct_paid_apps"
+    - "distinct_iap_apps"
+    - "distinct_rating_everyone_apps"
+    - "distinct_rating_teen_apps"
+    - "distinct_rating_mature_apps"
+    - "distinct_rating_everyone10plus_apps"
+    - "distinct_rating_12plus_apps"
+    - "distinct_rating_16plus_apps"
+    - "distinct_rating_18plus_apps"
+    - "distinct_rating_adults18plus_apps"
+    - "bids_day_rate"
+    - "bids_night_rate"
+    - "bids_weekday_rate"
+    - "bids_weekend_rate"
+    - "bids_hour_0_2_rate"
+    - "bids_hour_3_5_rate"
+    - "bids_hour_6_8_rate"
+    - "bids_hour_9_11_rate"
+    - "bids_hour_12_14_rate"
+    - "bids_hour_15_17_rate"
+    - "bids_hour_18_20_rate"
+    - "bids_hour_21_23_rate"
+    - "total_events"
+    - "bids_event_count"
+    - "total_distinct_apps"
+    - "unique_bid_apps"
+    - "bids_apps_top_1"
+    - "bids_apps_top_2"
+    - "bids_apps_top_3"
+    - "bids_apps_top_4"
+    - "bids_apps_top_5"
+    - "bids_apps_top_6"
+    - "bids_apps_top_7"
+    - "bids_apps_top_8"
+    - "bids_apps_top_9"
+    - "bids_apps_top_10"
+    - "bids_genres_top_1"
+    - "bids_genres_top_2"
+    - "bids_genres_top_3"
+    - "bids_genres_top_4"
+    - "bids_genres_top_5"
+    - "organic_apps_top_1"
+    - "organic_apps_top_2"
+    - "organic_apps_top_3"
+    - "organic_apps_top_4"
+    - "organic_apps_top_5"
+    - "organic_apps_top_6"
+    - "organic_apps_top_7"
+    - "organic_apps_top_8"
+    - "organic_apps_top_9"
+    - "organic_apps_top_10"
+    - "organic_genres_top_1"
+    - "organic_genres_top_2"
+    - "organic_genres_top_3"
+    - "organic_genres_top_4"
+    - "organic_genres_top_5"
+  client_feature_cols:
+    - "client_genreid"
+    - "client_content_rating"
+    - "client_score_45plus"
+    - "client_score_40_45"
+    - "client_score_30_40"
+    - "client_score_below30"
+    - "client_score_missing"
+    - "client_installs_10m_plus"
+    - "client_installs_1m_10m"
+    - "client_installs_100k_1m"
+    - "client_installs_below100k"
+    - "client_installs_missing"
+    - "client_age_0_3months"
+    - "client_age_3_12months"
+    - "client_age_1_2years"
+    - "client_age_2plus_years"
+    - "client_is_free"
+    - "client_has_iap"
+    - "client_rating_everyone"
+    - "client_rating_teen"
+    - "client_rating_mature"
+    - "client_rating_everyone10plus"
+    - "client_rating_rated3plus"
+    - "client_rating_rated7plus"
+    - "client_rating_rated12plus"
+    - "client_rating_rated16plus"
+    - "client_rating_rated18plus"
+    - "client_rating_adults18plus"
+    - "client_is_finance"
+    - "client_is_shopping"
+    - "client_is_food_delivery"
+    - "client_is_gaming"
+    - "client_is_entertainment"
+    - "client_is_social"
+    - "client_is_education"
+    - "client_is_utility"
+    - "client_is_health"
+    - "client_is_travel"
+    - "client_is_news"
+    - "client_is_crypto"
+    - "client_is_lending"
+    - "client_is_investment"
+    - "client_is_grocery"
   user_multi_cols: []
   client_multi_cols: []
 
@@ -18,36 +172,36 @@ train:
   run_name: null
   seed: 42
   batch_size: 4096
-  epochs: 3
+  epochs: 20
   lr: 0.001
   weight_decay: 0.0
   embed_dim: 1024
   dcn_cross_layers: 3
-  mlp_hidden_dims: [1024, 1024]
-  min_count: 5
-  num_oov_buckets: 1000
+  mlp_hidden_dims: [128, 128]
+  min_count: 1000
+  num_oov_buckets: 8
   multi_max_tokens: 32
   num_workers: 4
   device: "cuda"
   pretrained_emb_dim: 128
-  pretrained_cat_emb_dim: 64
+  pretrained_cat_emb_dim: 128
   freeze_pretrained_base: true
   multi_cat_pool: "mean"
-  client_mlp_hidden: [256, 256]
+  client_mlp_hidden: [128, 128]
 
 infer:
-  topk_clients: 200
+  topk_clients: 1
   infer_stream_batch_rows: 65536
   num_physical_gpus: 1
   workers_per_gpu: 1
-  ranking_output: "s3://.../user_client_rankings/"
+  ranking_output: "s3://mobavenue-simplismart-aws-s3-apse-sg/rtb/data/two_tower_ml/user_client_rankings/"
 
 mlflow_tracking_uri: null
 
 # Optional: broadcast one client metadata row onto all train/val rows (Grofers / single-client runs).
 data:
-  inject_single_client_metadata: false
-  single_client_metadata_uri: null
+  inject_single_client_metadata: true
+  single_client_metadata_uri: "s3://mobavenue-simplismart-aws-s3-apse-sg/rtb/data/two_tower_ml/client_metadata/"
   single_client_row_filter: null
   single_client_features_hardcoded: null
 
