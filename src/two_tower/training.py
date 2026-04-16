@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import math
 import pickle
+import time
 from pathlib import Path
 from typing import Union
 
@@ -23,6 +24,7 @@ from two_tower.features.encode import collate_fn
 from two_tower.features.prepare import FeatureArtifacts, prepare_training_features
 from two_tower.features.vocab import vocab_to_dict
 from two_tower.io.paths import artifact_uri
+from two_tower.io.runlog import start_run_log
 from two_tower.mlflow_utils import setup_mlflow
 from two_tower.model.two_tower import build_two_tower_model, embedding_dim_for_cardinality
 
@@ -72,6 +74,8 @@ def train_and_log(
     val_df: pd.DataFrame | None = None,
     feature_artifacts: FeatureArtifacts | None = None,
 ) -> None:
+    runlog = start_run_log(kind="train", name="two_tower")
+    t_start = time.time()
     if not isinstance(cfg, PipelineConfig):
         cfg = load_pipeline_config(cfg)
 
@@ -79,6 +83,8 @@ def train_and_log(
         train_df, val_df = load_train_validation_frames(cfg)
 
     print(f"[train_and_log] train={train_df.shape} val={val_df.shape}")
+    runlog.write(f"CONFIG experiment={cfg.train.experiment_name} device={cfg.train.device} epochs={cfg.train.epochs}")
+    runlog.write(f"DATA train_rows={train_df.shape[0]} val_rows={val_df.shape[0]}")
 
     if feature_artifacts is None:
         feature_artifacts = prepare_training_features(train_df, val_df, cfg)
@@ -139,71 +145,44 @@ def train_and_log(
 
     setup_mlflow(cfg.mlflow_tracking_uri, tc.experiment_name)
 
-    with mlflow.start_run(run_name=tc.run_name):
-        mlflow.log_params(
-            {
-                "batch_size": tc.batch_size,
-                "lr": tc.lr,
-                "weight_decay": tc.weight_decay,
-                "epochs": tc.epochs,
-                "emb_dim": tc.embed_dim,
-                "num_cross_layers": tc.dcn_cross_layers,
-                "user_deep_hidden": str(list(tc.mlp_hidden_dims)),
-                "client_mlp_hidden": str(list(tc.client_mlp_hidden)),
-                "log_scale_init": round(math.log(20.0), 4),
-                "user_input_dim": user_input_dim,
-                "client_input_dim": client_input_dim,
-                "min_token_count": tc.min_count,
-                "num_oov_buckets": tc.num_oov_buckets,
-                "multi_cat_max_tokens": tc.multi_max_tokens,
-                "multi_cat_pool": tc.multi_cat_pool,
-                "pretrained_emb_dim": tc.pretrained_emb_dim,
-                "pretrained_cat_emb_dim": tc.pretrained_cat_emb_dim,
-                "freeze_pretrained_base": tc.freeze_pretrained_base,
-                "use_pretrained_cat": use_pt,
-            }
-        )
+    try:
+        with mlflow.start_run(run_name=tc.run_name):
+            mlflow.log_params(
+                {
+                    "batch_size": tc.batch_size,
+                    "lr": tc.lr,
+                    "weight_decay": tc.weight_decay,
+                    "epochs": tc.epochs,
+                    "emb_dim": tc.embed_dim,
+                    "num_cross_layers": tc.dcn_cross_layers,
+                    "user_deep_hidden": str(list(tc.mlp_hidden_dims)),
+                    "client_mlp_hidden": str(list(tc.client_mlp_hidden)),
+                    "log_scale_init": round(math.log(20.0), 4),
+                    "user_input_dim": user_input_dim,
+                    "client_input_dim": client_input_dim,
+                    "min_token_count": tc.min_count,
+                    "num_oov_buckets": tc.num_oov_buckets,
+                    "multi_cat_max_tokens": tc.multi_max_tokens,
+                    "multi_cat_pool": tc.multi_cat_pool,
+                    "pretrained_emb_dim": tc.pretrained_emb_dim,
+                    "pretrained_cat_emb_dim": tc.pretrained_cat_emb_dim,
+                    "freeze_pretrained_base": tc.freeze_pretrained_base,
+                    "use_pretrained_cat": use_pt,
+                }
+            )
 
-        best_val_auc = float("-inf")
-        best_epoch = -1
-        best_snapshot: dict | None = None
+            best_val_auc = float("-inf")
+            best_epoch = -1
+            best_snapshot: dict | None = None
 
-        for epoch in range(tc.epochs):
-            model.train()
-            total_loss = 0.0
-            total_count = 0
+            last_hb = time.time()
+            hb_every_s = 300.0  # 5 minutes
+            for epoch in range(tc.epochs):
+                model.train()
+                total_loss = 0.0
+                total_count = 0
 
-            for batch in train_loader:
-                user_cat = batch.user_cat.to(device)
-                user_num = batch.user_num.to(device)
-                user_multi = batch.user_multi.to(device)
-                client_cat = batch.client_cat.to(device)
-                client_num = batch.client_num.to(device)
-                client_multi = batch.client_multi.to(device)
-                labels = batch.label.to(device)
-
-                optimizer.zero_grad()
-                logits, _, _ = model(user_cat, user_num, client_cat, client_num, user_multi, client_multi)
-                loss = criterion(logits, labels)
-                loss.backward()
-                optimizer.step()
-
-                bs = labels.size(0)
-                total_loss += loss.item() * bs
-                total_count += bs
-
-            avg_train_loss = total_loss / max(total_count, 1)
-
-            model.eval()
-            val_loss = 0.0
-            val_count = 0
-            val_uemb_bad = 0
-            val_cemb_bad = 0
-            val_logits_nonfinite = 0
-            all_logits: list[torch.Tensor] = []
-            all_labels: list[torch.Tensor] = []
-            with torch.no_grad():
-                for batch in val_loader:
+                for batch in train_loader:
                     user_cat = batch.user_cat.to(device)
                     user_num = batch.user_num.to(device)
                     user_multi = batch.user_multi.to(device)
@@ -212,27 +191,64 @@ def train_and_log(
                     client_multi = batch.client_multi.to(device)
                     labels = batch.label.to(device)
 
-                    logits, uemb, cemb = model(
-                        user_cat, user_num, client_cat, client_num, user_multi, client_multi
-                    )
+                    optimizer.zero_grad()
+                    logits, _, _ = model(user_cat, user_num, client_cat, client_num, user_multi, client_multi)
                     loss = criterion(logits, labels)
+                    loss.backward()
+                    optimizer.step()
 
                     bs = labels.size(0)
-                    val_uemb_bad += int((~torch.isfinite(uemb)).any(dim=1).sum().item())
-                    val_cemb_bad += int((~torch.isfinite(cemb)).any(dim=1).sum().item())
-                    val_logits_nonfinite += int((~torch.isfinite(logits)).sum().item())
-                    val_loss += loss.item() * bs
-                    val_count += bs
-                    all_logits.append(logits.cpu())
-                    all_labels.append(labels.cpu())
+                    total_loss += loss.item() * bs
+                    total_count += bs
+                    now = time.time()
+                    if now - last_hb >= hb_every_s:
+                        runlog.write(
+                            f"HEARTBEAT epoch={epoch + 1}/{tc.epochs} seen={total_count} "
+                            f"avg_loss={total_loss / max(total_count, 1):.6f}"
+                        )
+                        last_hb = now
 
-            avg_val_loss = val_loss / max(val_count, 1)
-            y_true = torch.cat(all_labels).numpy().ravel()
-            y_score = torch.cat(all_logits).numpy().ravel()
-            try:
-                val_auc = float(roc_auc_score(y_true, y_score))
-            except ValueError:
-                val_auc = float("nan")
+                avg_train_loss = total_loss / max(total_count, 1)
+
+                model.eval()
+                val_loss = 0.0
+                val_count = 0
+                val_uemb_bad = 0
+                val_cemb_bad = 0
+                val_logits_nonfinite = 0
+                all_logits: list[torch.Tensor] = []
+                all_labels: list[torch.Tensor] = []
+                with torch.no_grad():
+                    for batch in val_loader:
+                        user_cat = batch.user_cat.to(device)
+                        user_num = batch.user_num.to(device)
+                        user_multi = batch.user_multi.to(device)
+                        client_cat = batch.client_cat.to(device)
+                        client_num = batch.client_num.to(device)
+                        client_multi = batch.client_multi.to(device)
+                        labels = batch.label.to(device)
+
+                        logits, uemb, cemb = model(
+                            user_cat, user_num, client_cat, client_num, user_multi, client_multi
+                        )
+                        loss = criterion(logits, labels)
+
+                        bs = labels.size(0)
+                        val_uemb_bad += int((~torch.isfinite(uemb)).any(dim=1).sum().item())
+                        val_cemb_bad += int((~torch.isfinite(cemb)).any(dim=1).sum().item())
+                        val_logits_nonfinite += int((~torch.isfinite(logits)).sum().item())
+                        val_loss += loss.item() * bs
+                        val_count += bs
+                        all_logits.append(logits.cpu())
+                        all_labels.append(labels.cpu())
+
+                avg_val_loss = val_loss / max(val_count, 1)
+                y_true = torch.cat(all_labels).numpy().ravel()
+                y_score = torch.cat(all_logits).numpy().ravel()
+                try:
+                    val_auc = float(roc_auc_score(y_true, y_score))
+                except ValueError:
+                    val_auc = float("nan")
 
             _z = np.clip(np.asarray(y_score, dtype=np.float64), -50.0, 50.0)
             val_prob = 1.0 / (1.0 + np.exp(-_z))
@@ -272,6 +288,10 @@ def train_and_log(
                 f"val_loss={avg_val_loss:.4f} | val_auc={val_auc:.4f} | "
                 f"val_prec={val_precision:.4f} val_rec={val_recall:.4f} | scale={_scale_val:.2f} | "
                 f"val_nonfinite uemb={val_uemb_bad} cemb={val_cemb_bad} logits={val_logits_nonfinite}"
+            )
+            runlog.write(
+                f"EPOCH_DONE epoch={epoch + 1}/{tc.epochs} train_loss={avg_train_loss:.6f} "
+                f"val_loss={avg_val_loss:.6f} val_auc={val_auc:.6f}"
             )
 
         if best_snapshot is not None:
@@ -391,3 +411,7 @@ def train_and_log(
         print(f"Wrote client embeddings to: {client_emb_uri}")
 
         print("[train_and_log] Done.")
+        runlog.write(f"FINISH ok=true elapsed_s={time.time() - t_start:.1f}")
+    except Exception as e:
+        runlog.write(f"FINISH ok=false elapsed_s={time.time() - t_start:.1f} error={e!r}")
+        raise

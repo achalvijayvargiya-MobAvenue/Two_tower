@@ -5,6 +5,28 @@ import pandas as pd
 from two_tower.configs import PipelineConfig
 
 
+def _resolve_injected_client_id(crow: pd.Series, cfg: PipelineConfig) -> tuple[str | None, object | None]:
+    candidates = [
+        cfg.features.client_id_col,
+        "client_id",
+        "client_bundle_id",
+        "client_bundle",
+        "clientId",
+        "bundle_id",
+        "client",
+    ]
+    for col in candidates:
+        if col and col in crow.index:
+            return col, crow[col]
+
+    row_filter = cfg.data_load.single_client_row_filter or {}
+    for col in candidates:
+        if col and col in row_filter:
+            return cfg.features.client_id_col, row_filter[col]
+
+    return None, None
+
+
 def load_train_validation_frames(cfg: PipelineConfig) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Load train and validation Parquet from S3 or local paths (``pd.read_parquet``).
 
@@ -43,6 +65,15 @@ def load_train_validation_frames(cfg: PipelineConfig) -> tuple[pd.DataFrame, pd.
             train_df[col] = crow[col]
             val_df[col] = crow[col]
             inj += 1
+
+        injected_id_col, injected_id_val = _resolve_injected_client_id(crow, cfg)
+        if injected_id_col is not None:
+            train_df[cfg.features.client_id_col] = injected_id_val
+            val_df[cfg.features.client_id_col] = injected_id_val
+            print(
+                f"[inject_client] set client id column {cfg.features.client_id_col!r} "
+                f"from metadata field {injected_id_col!r}"
+            )
         print(
             f"[inject_client] broadcast {inj} client columns from one metadata row "
             f"onto train={len(train_df):,} val={len(val_df):,} rows"
