@@ -1,0 +1,55 @@
+paths:
+  train: "s3://.../training_data_final/"
+  val: "s3://.../validation_data_final/"
+  infer: "s3://.../test_data_final/"
+  artifacts_base: "s3://.../two_tower_ml/"
+
+features:
+  label_col: "label"
+  device_id_col: "device_id"
+  client_id_col: "client_bundle_id"
+  user_feature_cols: []
+  client_feature_cols: []
+  user_multi_cols: []
+  client_multi_cols: []
+
+train:
+  experiment_name: "two_tower_dcnv2"
+  run_name: null
+  seed: 42
+  batch_size: 4096
+  epochs: 3
+  lr: 0.001
+  weight_decay: 0.0
+  embed_dim: 1024
+  dcn_cross_layers: 3
+  mlp_hidden_dims: [1024, 1024]
+  min_count: 5
+  num_oov_buckets: 1000
+  multi_max_tokens: 32
+  num_workers: 4
+  device: "cuda"
+  pretrained_emb_dim: 128
+  pretrained_cat_emb_dim: 64
+  freeze_pretrained_base: true
+  multi_cat_pool: "mean"
+  client_mlp_hidden: [256, 256]
+
+infer:
+  topk_clients: 200
+  infer_stream_batch_rows: 65536
+  num_physical_gpus: 1
+  workers_per_gpu: 1
+  ranking_output: "s3://.../user_client_rankings/"
+
+mlflow_tracking_uri: null
+
+# Optional: broadcast one client metadata row onto all train/val rows (Grofers / single-client runs).
+data:
+  inject_single_client_metadata: false
+  single_client_metadata_uri: null
+  single_client_row_filter: null
+  single_client_features_hardcoded: null
+
+extra: {}
+

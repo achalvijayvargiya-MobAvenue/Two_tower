@@ -1,0 +1,25 @@
+paths:
+  infer: "s3://.../test_data_final/"
+  artifacts_base: "s3://.../two_tower_ml/"
+
+features:
+  device_id_col: "device_id"
+  user_feature_cols: []
+  user_multi_cols: []
+
+infer:
+  topk_clients: 200
+  infer_stream_batch_rows: 65536
+  num_physical_gpus: 1
+  workers_per_gpu: 1
+  ranking_output: "s3://.../user_client_rankings/"
+  rank_user_batch: 4096
+  client_chunk: 8192
+  use_amp: true
+  amp_dtype: "float16"
+  output_min_rows_per_part: 100000
+  output_parquet_compression: "zstd"
+  debug_cuda: false
+
+extra: {}
+

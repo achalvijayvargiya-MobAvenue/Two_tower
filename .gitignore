@@ -1,0 +1,45 @@
+# =============================================================================
+# Minimal tracked set (whitelist). Only these are meant for Git / SageMaker:
+#   - src/two_tower/
+#   - requirements-mlops.txt
+#   - scripts/train.py, scripts/infer.py
+#   - configs/train.yaml, configs/infer.yaml
+# Everything else under the repo root stays untracked.
+# =============================================================================
+
+# Ignore all top-level files and directories
+/*
+!.gitignore
+!requirements-mlops.txt
+!src/
+!scripts/
+!configs/
+
+# scripts/: only the two entrypoints
+scripts/*
+!scripts/train.py
+!scripts/infer.py
+
+# configs/: only the two YAML files
+configs/*
+!configs/train.yaml
+!configs/infer.yaml
+
+# src/: only the two_tower package tree
+src/*
+!src/two_tower/
+
+# ---------------------------------------------------------------------------
+# Still exclude junk that can appear inside tracked paths
+# ---------------------------------------------------------------------------
+**/__pycache__/
+**/*.py[cod]
+**/.ipynb_checkpoints/
+
+# IDE / OS
+**/.DS_Store
+Thumbs.db
+
+# Secrets (never commit)
+.env
+*.pem

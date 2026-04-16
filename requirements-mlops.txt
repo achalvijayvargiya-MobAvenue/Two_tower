@@ -1,0 +1,17 @@
+# Two-tower MLOps stack (matches Ref_05_two_tower_mlflow_training_inference env cell).
+#
+# SageMaker AL2 images ship awscli + pinned botocore — do NOT add boto3 here;
+# upgrading botocore can break awscli. S3 reads use the preinstalled boto3 + s3fs + pyarrow.
+#
+# Install in notebook:  %pip install -q -r requirements-mlops.txt
+# Or from repo root:   pip install -r requirements-mlops.txt
+
+torch>=2.2.0
+pandas>=2.0.0
+numpy>=1.26.0
+scikit-learn>=1.4.0
+mlflow>=2.10.0
+pyarrow>=15.0.0
+s3fs>=2024.1.0
+polars>=0.20.0
+PyYAML>=6.0.0
