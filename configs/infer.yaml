@@ -8,7 +8,7 @@ features:
   user_multi_cols: []
 
 infer:
-  topk_clients: 200
+  topk_clients: 1
   infer_stream_batch_rows: 65536
   num_physical_gpus: 1
   workers_per_gpu: 1
@@ -21,8 +21,8 @@ infer:
   output_parquet_compression: "zstd"
   debug_cuda: false
   # Optional run-size controls for quick smoke tests (null = no limit).
-  max_files: 2
-  max_users_per_file: 50000
+  max_files: 10
+  max_users_per_file: 100000
 
 extra: {}
 
