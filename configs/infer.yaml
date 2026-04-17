@@ -1,5 +1,5 @@
 paths:
-  infer: "s3://mobavenue-simplismart-aws-s3-apse-sg/rtb/data/shabbir/ml_simple_shabbir_grofers/test_data_final/"
+  infer: "s3://mobavenue-simplismart-aws-s3-apse-sg/rtb/data/shabbir/ml_simple_shabbir_grofers/test_data_final/20260416_full/"
   artifacts_base: "s3://mobavenue-simplismart-aws-s3-apse-sg/rtb/data/two_tower_ml/"
 
 features:
@@ -21,8 +21,8 @@ infer:
   output_parquet_compression: "zstd"
   debug_cuda: false
   # Optional run-size controls for quick smoke tests (null = no limit).
-  max_files: 10
-  max_users_per_file: 100000
+  max_files: null
+  max_users_per_file: null
 
 extra: {}
 
