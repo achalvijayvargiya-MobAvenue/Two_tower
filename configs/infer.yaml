@@ -22,7 +22,7 @@ infer:
   debug_cuda: false
   # Optional run-size controls for quick smoke tests (null = no limit).
   max_files: 2
-  max_users_per_file: 5000
+  max_users_per_file: 50000
 
 extra: {}
 
