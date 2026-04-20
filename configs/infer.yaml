@@ -1,5 +1,5 @@
 paths:
-  infer: "s3://mobavenue-simplismart-aws-s3-apse-sg/rtb/data/two_tower_ml/test_data_final/20260419_full/"
+  infer: "s3://mobavenue-simplismart-aws-s3-apse-sg/rtb/data/two_tower_ml/test_data_final/20260416_full/"
   artifacts_base: "s3://mobavenue-simplismart-aws-s3-apse-sg/rtb/data/two_tower_ml/"
 
 features:

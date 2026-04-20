@@ -1,7 +1,7 @@
 paths:
   train: "s3://mobavenue-simplismart-aws-s3-apse-sg/rtb/data/shabbir/ml_simple_shabbir_grofers/training_data_final/"
   val: "s3://mobavenue-simplismart-aws-s3-apse-sg/rtb/data/shabbir/ml_simple_shabbir_grofers/validation_data_final/"
-  infer: "s3://mobavenue-simplismart-aws-s3-apse-sg/rtb/data/two_tower_ml/test_data_final/20260419_full/"
+  infer: "s3://mobavenue-simplismart-aws-s3-apse-sg/rtb/data/two_tower_ml/test_data_final/20260416_full/"
   artifacts_base: "s3://mobavenue-simplismart-aws-s3-apse-sg/rtb/data/two_tower_ml/"
 
 features:
