@@ -8,10 +8,10 @@ features:
   user_multi_cols: []
 
 infer:
-  topk_clients: 1
+  topk_clients: 2
   infer_stream_batch_rows: 65536
-  num_physical_gpus: 2
-  workers_per_gpu: 1
+  num_physical_gpus: 3
+  workers_per_gpu: 2
   ranking_output: "s3://mobavenue-simplismart-aws-s3-apse-sg/rtb/data/two_tower_ml/user_client_rankings/"
   rank_user_batch: 1024
   client_chunk: 2048
