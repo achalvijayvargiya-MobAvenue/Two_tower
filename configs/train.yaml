@@ -203,7 +203,7 @@ mlflow_tracking_uri: null
 # - inject_single_client_metadata: broadcast one metadata row (single-client only; mutually exclusive).
 data:
   # Set true when train/val have client_id_col but no client_* columns (join from client_metadata Parquet).
-  merge_client_metadata: false
+  merge_client_metadata: true
   client_metadata_uri: "s3://mobavenue-simplismart-aws-s3-apse-sg/rtb/data/two_tower_ml/client_metadata/"
   inject_single_client_metadata: false
   single_client_metadata_uri: "s3://mobavenue-simplismart-aws-s3-apse-sg/rtb/data/two_tower_ml/client_metadata/"
