@@ -10,11 +10,11 @@ features:
 infer:
   topk_clients: 1
   infer_stream_batch_rows: 65536
-  num_physical_gpus: 4
+  num_physical_gpus: 2
   workers_per_gpu: 1
   ranking_output: "s3://mobavenue-simplismart-aws-s3-apse-sg/rtb/data/two_tower_ml/user_client_rankings/"
-  rank_user_batch: 4096
-  client_chunk: 8192
+  rank_user_batch: 1024
+  client_chunk: 2048
   use_amp: true
   amp_dtype: "float16"
   output_min_rows_per_part: 100000
