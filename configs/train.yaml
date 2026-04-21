@@ -1,6 +1,6 @@
 paths:
-  train: "s3://mobavenue-simplismart-aws-s3-apse-sg/rtb/data/shabbir/ml_simple_shabbir_grofers/training_data_final/"
-  val: "s3://mobavenue-simplismart-aws-s3-apse-sg/rtb/data/shabbir/ml_simple_shabbir_grofers/validation_data_final/"
+  train: "s3://mobavenue-simplismart-aws-s3-apse-sg/rtb/data/two_tower_ml/combined_data/training_data_final/"
+  val: "s3://mobavenue-simplismart-aws-s3-apse-sg/rtb/data/two_tower_ml/combined_data/validation_data_final/"
   infer: "s3://mobavenue-simplismart-aws-s3-apse-sg/rtb/data/two_tower_ml/test_data_final/20260416_full/"
   artifacts_base: "s3://mobavenue-simplismart-aws-s3-apse-sg/rtb/data/two_tower_ml/"
 
@@ -198,9 +198,14 @@ infer:
 
 mlflow_tracking_uri: null
 
-# Optional: broadcast one client metadata row onto all train/val rows (Grofers / single-client runs).
+# Optional client metadata:
+# - merge_client_metadata: per-row join on client_id_col (multi-client train/val).
+# - inject_single_client_metadata: broadcast one metadata row (single-client only; mutually exclusive).
 data:
-  inject_single_client_metadata: true
+  # Set true when train/val have client_id_col but no client_* columns (join from client_metadata Parquet).
+  merge_client_metadata: false
+  client_metadata_uri: "s3://mobavenue-simplismart-aws-s3-apse-sg/rtb/data/two_tower_ml/client_metadata/"
+  inject_single_client_metadata: false
   single_client_metadata_uri: "s3://mobavenue-simplismart-aws-s3-apse-sg/rtb/data/two_tower_ml/client_metadata/"
   single_client_row_filter: null
   single_client_features_hardcoded: null

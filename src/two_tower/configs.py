@@ -103,6 +103,10 @@ class InferJobConfig:
 class DataLoadConfig:
     """Optional preprocessing when loading train/val (matches reference notebook)."""
 
+    # Per-row join: ``client_metadata`` Parquet (same schema as pipeline ``client_metadata`` table)
+    merge_client_metadata: bool = False
+    client_metadata_uri: str | None = None
+
     inject_single_client_metadata: bool = False
     single_client_metadata_uri: str | None = None
     single_client_row_filter: dict[str, Any] | None = None

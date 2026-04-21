@@ -135,6 +135,8 @@ def load_pipeline_config(path: str | Path) -> PipelineConfig:
         raise TypeError("data.single_client_features_hardcoded must be a mapping or null")
 
     data_load = DataLoadConfig(
+        merge_client_metadata=bool(d.get("merge_client_metadata", False)),
+        client_metadata_uri=d.get("client_metadata_uri"),
         inject_single_client_metadata=bool(d.get("inject_single_client_metadata", False)),
         single_client_metadata_uri=d.get("single_client_metadata_uri"),
         single_client_row_filter=dict(row_filter) if row_filter else None,
