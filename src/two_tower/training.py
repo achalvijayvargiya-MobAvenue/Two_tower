@@ -13,7 +13,16 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from sklearn.metrics import precision_score, recall_score, roc_auc_score
+from sklearn.metrics import (
+    accuracy_score,
+    average_precision_score,
+    confusion_matrix,
+    f1_score,
+    log_loss,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
 from torch.utils.data import DataLoader
 
 from two_tower.config_loader import load_pipeline_config
@@ -67,6 +76,64 @@ def _resolve_client_id_column(train_df: pd.DataFrame, preferred: str) -> str:
     )
 
 
+def _sigmoid_prob_from_logits(y_score: np.ndarray) -> np.ndarray:
+    # Clamp for numerical stability (avoids overflow in exp).
+    z = np.clip(np.asarray(y_score, dtype=np.float64), -50.0, 50.0)
+    return 1.0 / (1.0 + np.exp(-z))
+
+
+def _binary_metrics(
+    y_true: np.ndarray,
+    y_score: np.ndarray,
+    *,
+    threshold: float = 0.5,
+) -> dict[str, float]:
+    """
+    Compute a compact set of binary classification metrics from labels and scores.
+
+    - y_true: 0/1 labels (any numeric dtype ok)
+    - y_score: model scores (logits or probabilities are fine; AUCs treat as ranking)
+    """
+    yt = np.asarray(y_true).astype(np.int32).ravel()
+    ys = np.asarray(y_score, dtype=np.float64).ravel()
+
+    # For probability-based metrics, interpret y_score as logits (current training loop output).
+    prob = _sigmoid_prob_from_logits(ys)
+    pred = (prob >= float(threshold)).astype(np.int32)
+
+    out: dict[str, float] = {}
+    # Ranking metrics
+    try:
+        out["auc_roc"] = float(roc_auc_score(yt, ys))
+    except ValueError:
+        out["auc_roc"] = float("nan")
+    try:
+        out["auc_pr"] = float(average_precision_score(yt, ys))
+    except ValueError:
+        out["auc_pr"] = float("nan")
+
+    # Threshold metrics
+    out["precision"] = float(precision_score(yt, pred, zero_division=0))
+    out["recall"] = float(recall_score(yt, pred, zero_division=0))
+    out["f1"] = float(f1_score(yt, pred, zero_division=0))
+    out["accuracy"] = float(accuracy_score(yt, pred))
+
+    # Calibration-ish / probabilistic
+    try:
+        out["logloss"] = float(log_loss(yt, prob, labels=[0, 1]))
+    except ValueError:
+        out["logloss"] = float("nan")
+
+    # Class balance + confusion matrix (useful for "is it predicting all zeros?")
+    out["label_pos_rate"] = float(yt.mean()) if yt.size else float("nan")
+    cm = confusion_matrix(yt, pred, labels=[0, 1])
+    out["tn"] = float(cm[0, 0])
+    out["fp"] = float(cm[0, 1])
+    out["fn"] = float(cm[1, 0])
+    out["tp"] = float(cm[1, 1])
+    return out
+
+
 def train_and_log(
     *,
     cfg: Union[PipelineConfig, str, Path],
@@ -83,6 +150,7 @@ def train_and_log(
         train_df, val_df = load_train_validation_frames(cfg)
 
     print(f"[train_and_log] train={train_df.shape} val={val_df.shape}")
+    print(f"[train_and_log] run log: {runlog.path}")
     runlog.write(f"CONFIG experiment={cfg.train.experiment_name} device={cfg.train.device} epochs={cfg.train.epochs}")
     runlog.write(f"DATA train_rows={train_df.shape[0]} val_rows={val_df.shape[0]}")
 
@@ -181,6 +249,13 @@ def train_and_log(
                 model.train()
                 total_loss = 0.0
                 total_count = 0
+                # Optional: compute train AUC/precision/recall on a bounded sample of seen examples.
+                # This helps diagnose overfitting (train >> val) without storing the full epoch.
+                train_eval_max = int(getattr(tc, "train_eval_max_examples", 0) or 0)
+                train_eval_max = max(train_eval_max, 0)
+                train_scores: list[np.ndarray] = []
+                train_labels: list[np.ndarray] = []
+                train_eval_kept = 0
 
                 for batch in train_loader:
                     user_cat = batch.user_cat.to(device)
@@ -200,6 +275,14 @@ def train_and_log(
                     bs = labels.size(0)
                     total_loss += loss.item() * bs
                     total_count += bs
+
+                    if train_eval_max > 0 and train_eval_kept < train_eval_max:
+                        # Keep up to train_eval_max examples (first-N) for stable, cheap epoch metrics.
+                        keep = min(bs, train_eval_max - train_eval_kept)
+                        if keep > 0:
+                            train_scores.append(logits.detach().cpu().numpy().ravel()[:keep])
+                            train_labels.append(labels.detach().cpu().numpy().ravel()[:keep])
+                            train_eval_kept += keep
                     now = time.time()
                     if now - last_hb >= hb_every_s:
                         runlog.write(
@@ -209,6 +292,11 @@ def train_and_log(
                         last_hb = now
 
                 avg_train_loss = total_loss / max(total_count, 1)
+                train_metrics: dict[str, float] | None = None
+                if train_eval_max > 0 and train_eval_kept > 0:
+                    ytr = np.concatenate(train_labels, axis=0)
+                    yts = np.concatenate(train_scores, axis=0)
+                    train_metrics = _binary_metrics(ytr, yts, threshold=0.5)
 
                 model.eval()
                 val_loss = 0.0
@@ -245,20 +333,11 @@ def train_and_log(
                 avg_val_loss = val_loss / max(val_count, 1)
                 y_true = torch.cat(all_labels).numpy().ravel()
                 y_score = torch.cat(all_logits).numpy().ravel()
-                try:
-                    val_auc = float(roc_auc_score(y_true, y_score))
-                except ValueError:
-                    val_auc = float("nan")
+                val_metrics = _binary_metrics(y_true, y_score, threshold=0.5)
+                val_auc = float(val_metrics["auc_roc"])
 
-            _z = np.clip(np.asarray(y_score, dtype=np.float64), -50.0, 50.0)
-            val_prob = 1.0 / (1.0 + np.exp(-_z))
-            val_pred = (val_prob >= 0.5).astype(np.int32)
-            _yt = np.asarray(y_true).astype(np.int32)
-            val_precision = float(precision_score(_yt, val_pred, zero_division=0))
-            val_recall = float(recall_score(_yt, val_pred, zero_division=0))
-
-            if np.isfinite(val_auc) and val_auc > best_val_auc:
-                best_val_auc = val_auc
+                if np.isfinite(val_auc) and val_auc > best_val_auc:
+                    best_val_auc = val_auc
                 best_epoch = epoch
                 best_snapshot = {
                     "user_tower": {k: v.detach().cpu().clone() for k, v in model.user_tower.state_dict().items()},
@@ -268,30 +347,67 @@ def train_and_log(
                 print(f"  -> new best val_auc={best_val_auc:.4f} (epoch {epoch + 1})")
 
             _scale_val = model.log_scale.clamp(math.log(1.0), math.log(100.0)).exp().item()
-            mlflow.log_metrics(
-                {
-                    "train_loss": avg_train_loss,
-                    "val_loss": avg_val_loss,
-                    "val_auc": val_auc,
-                    "val_uemb_nonfinite_rows": val_uemb_bad,
-                    "val_cemb_nonfinite_rows": val_cemb_bad,
-                    "val_logits_nonfinite_cells": val_logits_nonfinite,
-                    "val_precision": val_precision,
-                    "val_recall": val_recall,
-                    "temperature_scale": _scale_val,
-                },
-                step=epoch,
-            )
+            metrics_to_log = {
+                "train_loss": avg_train_loss,
+                "val_loss": avg_val_loss,
+                "val_uemb_nonfinite_rows": float(val_uemb_bad),
+                "val_cemb_nonfinite_rows": float(val_cemb_bad),
+                "val_logits_nonfinite_cells": float(val_logits_nonfinite),
+                "temperature_scale": _scale_val,
+                # validation (rich)
+                "val_auc": float(val_metrics["auc_roc"]),
+                "val_auc_pr": float(val_metrics["auc_pr"]),
+                "val_precision": float(val_metrics["precision"]),
+                "val_recall": float(val_metrics["recall"]),
+                "val_f1": float(val_metrics["f1"]),
+                "val_accuracy": float(val_metrics["accuracy"]),
+                "val_logloss": float(val_metrics["logloss"]),
+                "val_label_pos_rate": float(val_metrics["label_pos_rate"]),
+                "val_tn": float(val_metrics["tn"]),
+                "val_fp": float(val_metrics["fp"]),
+                "val_fn": float(val_metrics["fn"]),
+                "val_tp": float(val_metrics["tp"]),
+            }
+            if train_metrics is not None:
+                metrics_to_log.update(
+                    {
+                        "train_auc": float(train_metrics["auc_roc"]),
+                        "train_auc_pr": float(train_metrics["auc_pr"]),
+                        "train_precision": float(train_metrics["precision"]),
+                        "train_recall": float(train_metrics["recall"]),
+                        "train_f1": float(train_metrics["f1"]),
+                        "train_accuracy": float(train_metrics["accuracy"]),
+                        "train_logloss": float(train_metrics["logloss"]),
+                        "train_label_pos_rate": float(train_metrics["label_pos_rate"]),
+                    }
+                )
+            mlflow.log_metrics(metrics_to_log, step=epoch)
 
             print(
                 f"Epoch {epoch + 1}/{tc.epochs} | train_loss={avg_train_loss:.4f} | "
-                f"val_loss={avg_val_loss:.4f} | val_auc={val_auc:.4f} | "
-                f"val_prec={val_precision:.4f} val_rec={val_recall:.4f} | scale={_scale_val:.2f} | "
+                f"val_loss={avg_val_loss:.4f} | val_auc={val_metrics['auc_roc']:.4f} | "
+                f"val_pr_auc={val_metrics['auc_pr']:.4f} | "
+                f"val_prec={val_metrics['precision']:.4f} val_rec={val_metrics['recall']:.4f} "
+                f"val_f1={val_metrics['f1']:.4f} | scale={_scale_val:.2f} | "
                 f"val_nonfinite uemb={val_uemb_bad} cemb={val_cemb_bad} logits={val_logits_nonfinite}"
             )
+            if train_metrics is not None:
+                print(
+                    f"           train_auc={train_metrics['auc_roc']:.4f} train_pr_auc={train_metrics['auc_pr']:.4f} "
+                    f"train_prec={train_metrics['precision']:.4f} train_rec={train_metrics['recall']:.4f} "
+                    f"train_f1={train_metrics['f1']:.4f} (sample_n={train_eval_kept})"
+                )
             runlog.write(
-                f"EPOCH_DONE epoch={epoch + 1}/{tc.epochs} train_loss={avg_train_loss:.6f} "
-                f"val_loss={avg_val_loss:.6f} val_auc={val_auc:.6f}"
+                "EPOCH_DONE "
+                f"epoch={epoch + 1}/{tc.epochs} "
+                f"train_loss={avg_train_loss:.6f} "
+                f"val_loss={avg_val_loss:.6f} "
+                f"val_auc={val_metrics['auc_roc']:.6f} val_auc_pr={val_metrics['auc_pr']:.6f} "
+                f"val_prec={val_metrics['precision']:.6f} val_rec={val_metrics['recall']:.6f} "
+                f"val_f1={val_metrics['f1']:.6f} val_acc={val_metrics['accuracy']:.6f} "
+                f"val_logloss={val_metrics['logloss']:.6f} "
+                f"val_cm_tn={int(val_metrics['tn'])} val_cm_fp={int(val_metrics['fp'])} "
+                f"val_cm_fn={int(val_metrics['fn'])} val_cm_tp={int(val_metrics['tp'])}"
             )
 
         if best_snapshot is not None:
