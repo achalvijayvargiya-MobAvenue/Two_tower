@@ -14,6 +14,7 @@ from two_tower.io.runlog import start_run_log
 
 def run_inference_job(cfg: InferJobConfig) -> None:
     """Spawn workers to rank users against precomputed client embeddings (reference flow)."""
+    DEBUG_DEVICE_ID = "41d8c21e-b325-8e9d-27b2-760d9bab21ab"
     ic = cfg.infer
     runlog = start_run_log(kind="infer", name="two_tower")
     t_start = time.time()
@@ -41,12 +42,44 @@ def run_inference_job(cfg: InferJobConfig) -> None:
                 f"infer.max_files={ic.max_files} filtered out all inputs under {cfg.paths.infer!r}"
             )
 
+    # Debug flow: locate the first file that contains the target device id, then run
+    # inference only on that one file (so we don't read/score all inputs).
+    if DEBUG_DEVICE_ID:
+        import polars as pl
+
+        hit: str | None = None
+        for fp in infer_files:
+            try:
+                q = (
+                    pl.scan_parquet(fp, columns=[device_id_col])
+                    .select(pl.col(device_id_col).cast(pl.Utf8).alias(device_id_col))
+                    .filter(pl.col(device_id_col) == DEBUG_DEVICE_ID)
+                    .limit(1)
+                )
+                got = q.collect(streaming=True)
+                if len(got) > 0:
+                    hit = fp
+                    break
+            except Exception:
+                # If a file can't be scanned (corrupt/permission/etc), just skip it.
+                continue
+
+        if hit is None:
+            raise FileNotFoundError(
+                f"Debug device id {DEBUG_DEVICE_ID!r} not found in any infer file under {cfg.paths.infer!r}"
+            )
+        infer_files = [hit]
+        print(f"[infer][debug] limiting to device_id={DEBUG_DEVICE_ID} in file={hit}")
+        runlog.write(f"DEBUG device_id={DEBUG_DEVICE_ID} file={hit}")
+
     out_dir = ic.ranking_output.rstrip("/")
     if not out_dir.startswith("s3://"):
         Path(out_dir).mkdir(parents=True, exist_ok=True)
     out_prefix = out_dir if out_dir.endswith("/") else out_dir + "/"
 
     num_workers = max(1, int(ic.num_physical_gpus) * max(1, int(ic.workers_per_gpu)))
+    if DEBUG_DEVICE_ID:
+        num_workers = 1
 
     print(f"[infer] {num_workers} workers | {len(infer_files)} files | top-{ic.topk_clients}")
     if ic.max_files is not None or ic.max_users_per_file is not None:

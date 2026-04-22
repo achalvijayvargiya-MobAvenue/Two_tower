@@ -22,6 +22,9 @@ from two_tower.io.uris import read_uri_bytes
 from two_tower.model.two_tower import DCNv2UserTower
 
 
+DEBUG_DEVICE_ID = "41d8c21e-b325-8e9d-27b2-760d9bab21ab"
+
+
 def _iter_record_batches(dset: Any, cols: list[str], batch_size: int):
     try:
         yield from pads.Scanner.from_dataset(dset, columns=cols, batch_size=batch_size).to_batches()
@@ -73,6 +76,11 @@ def _rank_batch_topk(
     to_device: torch.device,
 ) -> pd.DataFrame:
     device_ids = infer_df[device_id_col].to_numpy()
+    if DEBUG_DEVICE_ID:
+        try:
+            print(f"[infer][debug] scoring device_ids={device_ids.tolist()}", flush=True)
+        except Exception:
+            pass
     uc = encode_cats(infer_df, user_cat_cols, user_vocabs)
     un = encode_nums(infer_df, user_num_cols)
     um = encode_multi_matrix(infer_df, user_multi_cols, user_multi_vocabs, multi_max_tokens)
@@ -104,6 +112,13 @@ def _rank_batch_topk(
 
     with torch.inference_mode(), ctx:
         uemb = user_tower(uc, un, um)
+        if DEBUG_DEVICE_ID:
+            u_nan = int(torch.isnan(uemb).sum().item())
+            u_inf = int(torch.isinf(uemb).sum().item())
+            print(
+                f"[infer][debug] uemb shape={tuple(uemb.shape)} nan={u_nan} inf={u_inf}",
+                flush=True,
+            )
 
         best_scores = torch.full((bsz, topk), -1.0, device=to_device, dtype=torch.float32)
         best_idx = torch.full((bsz, topk), -1, device=to_device, dtype=torch.int64)
@@ -111,7 +126,17 @@ def _rank_batch_topk(
         for start in range(0, n_clients, client_chunk):
             end = min(start + client_chunk, n_clients)
             chunk = client_emb_t[start:end]
-            scores = torch.sigmoid((uemb @ chunk.T).float())
+            logits = (uemb @ chunk.T).float()
+            scores = torch.sigmoid(logits)
+            if DEBUG_DEVICE_ID and start == 0:
+                l_nan = int(torch.isnan(logits).sum().item())
+                l_inf = int(torch.isinf(logits).sum().item())
+                s_nan = int(torch.isnan(scores).sum().item())
+                s_inf = int(torch.isinf(scores).sum().item())
+                print(
+                    f"[infer][debug] first-chunk logits nan={l_nan} inf={l_inf} | scores nan={s_nan} inf={s_inf}",
+                    flush=True,
+                )
             k = min(topk, end - start)
             cs, ci = torch.topk(scores, k=k, dim=1)
             ci = ci + start
@@ -286,6 +311,9 @@ def tt_infer_worker(
                 t0 = time.time()
                 bpl = pl.from_arrow(batch)
                 bpl = bpl.unique(subset=[device_id_col], keep="first", maintain_order=False)
+                bpl = bpl.filter(
+                    pl.col(device_id_col).cast(pl.Utf8) == "41d8c21e-b325-8e9d-27b2-760d9bab21ab"
+                )
                 bpl = bpl.filter(~pl.col(device_id_col).cast(pl.Utf8).is_in(seen))
                 if bpl.is_empty():
                     t0 = time.time()
@@ -342,10 +370,15 @@ def tt_infer_worker(
                     out_rows += len(out_df)
                     users_this_file += len(chunk)
                     _flush()
+                    if DEBUG_DEVICE_ID and users_this_file > 0:
+                        pending = None
+                        break
                     del out_df
                     gc.collect()
                 t0 = time.time()
                 if max_users_per_file is not None and users_this_file >= int(max_users_per_file):
+                    break
+                if DEBUG_DEVICE_ID and users_this_file > 0:
                     break
 
             if (
