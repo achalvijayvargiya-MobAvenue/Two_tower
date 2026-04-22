@@ -52,6 +52,8 @@ def _debug_one_user(
     client_ids_np: np.ndarray,
     topk: int,
     to_device: torch.device,
+    use_amp: bool,
+    amp_dtype_torch: torch.dtype,
 ) -> list[str]:
     """Return runlog-friendly lines with full debug values for a single-row frame."""
     if len(infer_df) != 1:
@@ -86,13 +88,19 @@ def _debug_one_user(
     uc_d = uc.to(to_device)
     un_d = un.to(to_device)
     um_d = um.to(to_device)
-    with torch.inference_mode():
+    ctx = (
+        torch.autocast(device_type="cuda", dtype=amp_dtype_torch)
+        if to_device.type == "cuda" and use_amp
+        else nullcontext()
+    )
+    with torch.inference_mode(), ctx:
         uemb = user_tower(uc_d, un_d, um_d)
     lines.append(f"uemb_stats={_tensor_stats(uemb)}")
     lines.append(f"uemb_values={_tensor_to_list(uemb)}")
 
-    logits_all = (uemb @ client_emb_t.T).float()
-    scores_all = torch.sigmoid(logits_all)
+    with torch.inference_mode(), ctx:
+        logits_all = (uemb @ client_emb_t.T).float()
+        scores_all = torch.sigmoid(logits_all)
     lines.append(f"logits_all_stats={_tensor_stats(logits_all)} scores_all_stats={_tensor_stats(scores_all)}")
 
     k = min(int(topk), int(scores_all.shape[1]))
@@ -422,6 +430,8 @@ def tt_infer_worker(
             users_this_file = 0
             debug_lines: list[str] = []
             last_write_debug.clear()
+            if DEBUG_DEVICE_ID:
+                debug_lines.append(f"runtime to_device={to_device.type} use_amp={use_amp} amp_dtype={amp_dtype_str}")
 
             t0 = time.time()
             dset = pads.dataset(parquet_path, format="parquet")
@@ -489,6 +499,8 @@ def tt_infer_worker(
                                 client_ids_np=client_ids_np,
                                 topk=topk,
                                 to_device=to_device,
+                                use_amp=use_amp,
+                                amp_dtype_torch=amp_dtype_torch,
                             )
                         except Exception as _e:
                             debug_lines = [f"debug failed: {repr(_e)}"]
@@ -520,6 +532,14 @@ def tt_infer_worker(
                     out_rows += len(out_df)
                     users_this_file += len(chunk)
                     _flush()
+                    if DEBUG_DEVICE_ID and len(chunk) == 1:
+                        try:
+                            s = out_df["score"]
+                            debug_lines.append(
+                                f"out_df_score_nulls={int(s.isna().sum())} out_df_score_minmax=({float(np.nanmin(s))},{float(np.nanmax(s))})"
+                            )
+                        except Exception as _e:
+                            debug_lines.append(f"out_df_score_debug_failed={repr(_e)}")
                     if DEBUG_DEVICE_ID and users_this_file > 0:
                         pending = None
                         break
