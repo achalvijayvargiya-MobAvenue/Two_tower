@@ -25,6 +25,7 @@ from two_tower.model.two_tower import DCNv2UserTower
 DEBUG_DEVICE_ID = "41d8c21e-b325-8e9d-27b2-760d9bab21ab"
 
 
+
 def _iter_record_batches(dset: Any, cols: list[str], batch_size: int):
     try:
         yield from pads.Scanner.from_dataset(dset, columns=cols, batch_size=batch_size).to_batches()

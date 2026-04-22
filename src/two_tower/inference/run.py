@@ -45,19 +45,31 @@ def run_inference_job(cfg: InferJobConfig) -> None:
     # Debug flow: locate the first file that contains the target device id, then run
     # inference only on that one file (so we don't read/score all inputs).
     if DEBUG_DEVICE_ID:
-        import polars as pl
+        import pyarrow as pa
+        import pyarrow.compute as pc
+        import pyarrow.dataset as pads
 
         hit: str | None = None
         for fp in infer_files:
             try:
-                q = (
-                    pl.scan_parquet(fp, columns=[device_id_col])
-                    .select(pl.col(device_id_col).cast(pl.Utf8).alias(device_id_col))
-                    .filter(pl.col(device_id_col) == DEBUG_DEVICE_ID)
-                    .limit(1)
+                dset = pads.dataset(fp, format="parquet")
+                if device_id_col not in dset.schema.names:
+                    continue
+                # Stream batches of the device_id column; stop early once found.
+                found = False
+                scanner = pads.Scanner.from_dataset(
+                    dset,
+                    columns=[device_id_col],
+                    batch_size=50_000,
                 )
-                got = q.collect(streaming=True)
-                if len(got) > 0:
+                for batch in scanner.to_batches():
+                    col = batch.column(0)
+                    # Robust against non-string physical types.
+                    mask = pc.equal(pc.cast(col, pa.string()), DEBUG_DEVICE_ID)
+                    if bool(pc.any(mask).as_py()):
+                        found = True
+                        break
+                if found:
                     hit = fp
                     break
             except Exception:
