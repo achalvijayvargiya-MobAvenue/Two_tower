@@ -351,15 +351,59 @@ def tt_infer_worker(
     out_buf: list[pd.DataFrame] = []
     out_rows = 0
     out_prefix = infer_ranking_output
+    last_write_debug: list[str] = []
 
     def _flush(force: bool = False) -> None:
-        nonlocal part, out_buf, out_rows
+        nonlocal part, out_buf, out_rows, last_write_debug
         if not out_buf or (not force and out_rows < output_min_rows):
             return
         merged = pl.concat([pl.from_pandas(d) for d in out_buf])
         path = f"{out_prefix}worker{worker_id:02d}_part_{part:06d}.parquet"
+
+        if DEBUG_DEVICE_ID:
+            try:
+                # What we're about to write (schema + nulls + small preview).
+                last_write_debug.append(f"output_path={path}")
+                last_write_debug.append(f"merged_schema={merged.schema}")
+                if "score" in merged.columns:
+                    last_write_debug.append(
+                        f"merged_score_dtype={merged['score'].dtype} "
+                        f"merged_score_nulls={int(merged['score'].null_count())}"
+                    )
+                    try:
+                        last_write_debug.append(
+                            f"merged_score_minmax=({float(merged['score'].min())},{float(merged['score'].max())})"
+                        )
+                    except Exception:
+                        pass
+                last_write_debug.append(f"merged_head={merged.head(10).to_dicts()}")
+            except Exception as _e:
+                last_write_debug.append(f"prewrite_debug_failed={repr(_e)}")
+
         merged.write_parquet(path, compression=output_compression)
         print(f"  [worker {worker_id}] wrote {path} ({len(merged):,} rows)", flush=True)
+
+        if DEBUG_DEVICE_ID:
+            try:
+                # Read-back verification (what was actually written).
+                back = pl.read_parquet(path)
+                last_write_debug.append(f"readback_schema={back.schema}")
+                if "score" in back.columns:
+                    last_write_debug.append(
+                        f"readback_score_dtype={back['score'].dtype} "
+                        f"readback_score_nulls={int(back['score'].null_count())}"
+                    )
+                    try:
+                        last_write_debug.append(
+                            f"readback_score_minmax=({float(back['score'].min())},{float(back['score'].max())})"
+                        )
+                    except Exception:
+                        pass
+                last_write_debug.append(f"readback_head={back.head(10).to_dicts()}")
+                del back
+            except Exception as _e:
+                last_write_debug.append(f"readback_debug_failed={repr(_e)}")
+
         del merged
         out_buf.clear()
         out_rows = 0
@@ -377,6 +421,7 @@ def tt_infer_worker(
             t_inf = 0.0
             users_this_file = 0
             debug_lines: list[str] = []
+            last_write_debug.clear()
 
             t0 = time.time()
             dset = pads.dataset(parquet_path, format="parquet")
@@ -571,7 +616,7 @@ def tt_infer_worker(
                     "inference_time": t_inf,
                     "total_time": time.time() - t_file,
                     "error": None,
-                    "debug_lines": debug_lines,
+                    "debug_lines": debug_lines + (last_write_debug if DEBUG_DEVICE_ID else []),
                 }
             )
         except Exception as e:
