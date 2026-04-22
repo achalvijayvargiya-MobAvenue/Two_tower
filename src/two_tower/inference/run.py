@@ -171,6 +171,9 @@ def run_inference_job(cfg: InferJobConfig) -> None:
             print(f"        {status.get('error')}")
             runlog.write(f"FILE_DONE ok=false file={status.get('file')} worker={status.get('worker')} error={status.get('error')}")
         else:
+            dbg = status.get("debug_lines") or []
+            for line in dbg:
+                runlog.write(f"DEBUG {line}")
             total_read += float(status.get("read_time", 0))
             total_prep += float(status.get("preprocess_time", 0))
             total_inf += float(status.get("inference_time", 0))

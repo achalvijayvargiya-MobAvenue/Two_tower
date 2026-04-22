@@ -26,6 +26,86 @@ DEBUG_DEVICE_ID = "41d8c21e-b325-8e9d-27b2-760d9bab21ab"
 
 
 
+def _tensor_to_list(t: torch.Tensor) -> list:
+    return t.detach().cpu().to(torch.float32).numpy().tolist()
+
+
+def _tensor_stats(t: torch.Tensor) -> dict[str, int]:
+    return {"nan": int(torch.isnan(t).sum().item()), "inf": int(torch.isinf(t).sum().item())}
+
+
+def _debug_one_user(
+    *,
+    infer_df: pd.DataFrame,
+    device_id_col: str,
+    user_cat_cols: list[str],
+    user_num_cols: list[str],
+    user_multi_cols: list[str],
+    user_vocabs: dict,
+    user_multi_vocabs: dict,
+    multi_max_tokens: int,
+    expected_vocab_sizes: list[int],
+    expected_cat_dim: int,
+    expected_num_dim: int,
+    user_tower: nn.Module,
+    client_emb_t: torch.Tensor,
+    client_ids_np: np.ndarray,
+    topk: int,
+    to_device: torch.device,
+) -> list[str]:
+    """Return runlog-friendly lines with full debug values for a single-row frame."""
+    if len(infer_df) != 1:
+        return [f"debug expected 1 row, got {len(infer_df)}"]
+
+    raw_row = infer_df.iloc[0].to_dict()
+    lines: list[str] = []
+    lines.append(f"device_id_col={device_id_col} device_id={raw_row.get(device_id_col)}")
+    lines.append(f"raw_row={raw_row}")
+
+    uc = encode_cats(infer_df, user_cat_cols, user_vocabs)
+    un = encode_nums(infer_df, user_num_cols)
+    um = encode_multi_matrix(infer_df, user_multi_cols, user_multi_vocabs, multi_max_tokens)
+
+    if uc.shape[1] < expected_cat_dim:
+        uc = torch.cat([uc, torch.zeros((uc.shape[0], expected_cat_dim - uc.shape[1]), dtype=uc.dtype)], dim=1)
+    elif uc.shape[1] > expected_cat_dim:
+        uc = uc[:, :expected_cat_dim]
+    if un.shape[1] < expected_num_dim:
+        un = torch.cat([un, torch.zeros((un.shape[0], expected_num_dim - un.shape[1]), dtype=un.dtype)], dim=1)
+    elif un.shape[1] > expected_num_dim:
+        un = un[:, :expected_num_dim]
+    for i, vmax in enumerate(expected_vocab_sizes):
+        if i < uc.shape[1]:
+            uc[:, i] = uc[:, i].clamp(0, int(vmax) - 1)
+
+    lines.append(f"uc_stats={_tensor_stats(uc)} un_stats={_tensor_stats(un)} um_stats={_tensor_stats(um)}")
+    lines.append(f"uc_values={_tensor_to_list(uc)}")
+    lines.append(f"un_values={_tensor_to_list(un)}")
+    lines.append(f"um_values={_tensor_to_list(um)}")
+
+    uc_d = uc.to(to_device)
+    un_d = un.to(to_device)
+    um_d = um.to(to_device)
+    with torch.inference_mode():
+        uemb = user_tower(uc_d, un_d, um_d)
+    lines.append(f"uemb_stats={_tensor_stats(uemb)}")
+    lines.append(f"uemb_values={_tensor_to_list(uemb)}")
+
+    logits_all = (uemb @ client_emb_t.T).float()
+    scores_all = torch.sigmoid(logits_all)
+    lines.append(f"logits_all_stats={_tensor_stats(logits_all)} scores_all_stats={_tensor_stats(scores_all)}")
+
+    k = min(int(topk), int(scores_all.shape[1]))
+    top_scores, top_idx = torch.topk(scores_all, k=k, dim=1)
+    top_logits = torch.gather(logits_all, 1, top_idx)
+    top_clients = client_ids_np[top_idx.detach().cpu().numpy().reshape(-1)].tolist()
+    lines.append(f"topk_clients={top_clients}")
+    lines.append(f"topk_logits={_tensor_to_list(top_logits)}")
+    lines.append(f"topk_scores={_tensor_to_list(top_scores)}")
+
+    return lines
+
+
 def _iter_record_batches(dset: Any, cols: list[str], batch_size: int):
     try:
         yield from pads.Scanner.from_dataset(dset, columns=cols, batch_size=batch_size).to_batches()
@@ -296,6 +376,7 @@ def tt_infer_worker(
             t_prep = 0.0
             t_inf = 0.0
             users_this_file = 0
+            debug_lines: list[str] = []
 
             t0 = time.time()
             dset = pads.dataset(parquet_path, format="parquet")
@@ -343,6 +424,29 @@ def tt_infer_worker(
                             break
                         if len(chunk) > remaining:
                             chunk = chunk.iloc[:remaining].copy()
+
+                    if DEBUG_DEVICE_ID and not debug_lines and len(chunk) == 1:
+                        try:
+                            debug_lines = _debug_one_user(
+                                infer_df=chunk,
+                                device_id_col=device_id_col,
+                                user_cat_cols=user_cat_cols,
+                                user_num_cols=user_num_cols,
+                                user_multi_cols=user_multi_cols,
+                                user_vocabs=user_vocabs,
+                                user_multi_vocabs=user_multi_vocabs,
+                                multi_max_tokens=multi_max_tokens,
+                                expected_vocab_sizes=expected_vocab_sizes,
+                                expected_cat_dim=expected_cat_dim,
+                                expected_num_dim=expected_num_dim,
+                                user_tower=user_tower,
+                                client_emb_t=client_emb_t,
+                                client_ids_np=client_ids_np,
+                                topk=topk,
+                                to_device=to_device,
+                            )
+                        except Exception as _e:
+                            debug_lines = [f"debug failed: {repr(_e)}"]
 
                     t0 = time.time()
                     out_df = _rank_batch_topk(
@@ -406,6 +510,28 @@ def tt_infer_worker(
 
                 t0 = time.time()
                 if len(chunk) > 0:
+                    if DEBUG_DEVICE_ID and not debug_lines and len(chunk) == 1:
+                        try:
+                            debug_lines = _debug_one_user(
+                                infer_df=chunk,
+                                device_id_col=device_id_col,
+                                user_cat_cols=user_cat_cols,
+                                user_num_cols=user_num_cols,
+                                user_multi_cols=user_multi_cols,
+                                user_vocabs=user_vocabs,
+                                user_multi_vocabs=user_multi_vocabs,
+                                multi_max_tokens=multi_max_tokens,
+                                expected_vocab_sizes=expected_vocab_sizes,
+                                expected_cat_dim=expected_cat_dim,
+                                expected_num_dim=expected_num_dim,
+                                user_tower=user_tower,
+                                client_emb_t=client_emb_t,
+                                client_ids_np=client_ids_np,
+                                topk=topk,
+                                to_device=to_device,
+                            )
+                        except Exception as _e:
+                            debug_lines = [f"debug failed: {repr(_e)}"]
                     out_df = _rank_batch_topk(
                         infer_df=chunk,
                         device_id_col=device_id_col,
@@ -445,6 +571,7 @@ def tt_infer_worker(
                     "inference_time": t_inf,
                     "total_time": time.time() - t_file,
                     "error": None,
+                    "debug_lines": debug_lines,
                 }
             )
         except Exception as e:
