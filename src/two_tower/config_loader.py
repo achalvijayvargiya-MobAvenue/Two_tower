@@ -122,6 +122,13 @@ def load_pipeline_config(path: str | Path) -> PipelineConfig:
         dataloader_prefetch_factor=int(t.get("dataloader_prefetch_factor", 2)),
         torch_compile=bool(t.get("torch_compile", False)),
         torch_compile_mode=str(t.get("torch_compile_mode", "reduce-overhead")),
+        downsample_train=bool(t.get("downsample_train", False)),
+        downsample_val=bool(t.get("downsample_val", False)),
+        downsample_neg_per_pos=int(t["downsample_neg_per_pos"])
+        if t.get("downsample_neg_per_pos") not in (None, "", 0)
+        else None,
+        downsample_equalize_client_rows=bool(t.get("downsample_equalize_client_rows", True)),
+        downsample_random_state=int(t.get("downsample_random_state", 42)),
         pretrained_emb_dim=int(t.get("pretrained_emb_dim", 128)),
         pretrained_cat_emb_dim=int(t.get("pretrained_cat_emb_dim", 64)),
         freeze_pretrained_base=bool(t.get("freeze_pretrained_base", True)),

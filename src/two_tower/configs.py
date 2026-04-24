@@ -55,6 +55,16 @@ class TrainConfig:
     torch_compile: bool = False
     torch_compile_mode: str = "reduce-overhead"
 
+    # Optional per-client downsampling (structured version of notebook Step 3a).
+    # Applied inside ``load_train_validation_frames`` so it works the same for notebook and DDP.
+    downsample_train: bool = False
+    downsample_val: bool = False
+    # Target negatives per positive within each client (None disables ratio balancing).
+    downsample_neg_per_pos: int | None = 10
+    # After ratio balancing, cap every client to the same row count (min across clients).
+    downsample_equalize_client_rows: bool = True
+    downsample_random_state: int = 42
+
     # Hash embedding init for categorical columns (reference: PRETRAINED_EMB_DIM)
     pretrained_emb_dim: int = 128
     pretrained_cat_emb_dim: int = 64

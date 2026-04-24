@@ -5,6 +5,123 @@ import pandas as pd
 from two_tower.configs import PipelineConfig
 
 
+def _balance_train_per_client(
+    df: pd.DataFrame,
+    neg_per_pos: int | None,
+    *,
+    ycol: str,
+    ccol: str,
+    rs: int,
+) -> pd.DataFrame:
+    """Undersample within each client so negatives:positives ≈ r:1 (no duplication)."""
+    if neg_per_pos is None:
+        return df
+    r = max(1, int(neg_per_pos))
+    parts: list[pd.DataFrame] = []
+    for i, (_cid, g) in enumerate(df.groupby(ccol, sort=False)):
+        pos = g[g[ycol] == 1]
+        neg = g[g[ycol] == 0]
+        n_p, n_n = len(pos), len(neg)
+        if n_p == 0 or n_n == 0:
+            parts.append(g)
+            continue
+        k = min(n_p, n_n // r)
+        rs_p, rs_n = rs + 2 * i, rs + 2 * i + 1
+        if k == 0:
+            m = min(n_p, n_n)
+            parts.append(
+                pd.concat(
+                    [pos.sample(n=m, random_state=rs_p), neg.sample(n=m, random_state=rs_n)],
+                    ignore_index=True,
+                )
+            )
+        else:
+            parts.append(
+                pd.concat(
+                    [pos.sample(n=k, random_state=rs_p), neg.sample(n=k * r, random_state=rs_n)],
+                    ignore_index=True,
+                )
+            )
+    return pd.concat(parts, ignore_index=True) if parts else df.iloc[:0]
+
+
+def _equalize_clients_to_min_rows_keep_ratio(
+    df: pd.DataFrame,
+    neg_per_pos: int | None,
+    *,
+    ycol: str,
+    ccol: str,
+    rs: int,
+) -> pd.DataFrame:
+    """Downsample each client to the same row count while keeping neg:pos = r:1 per client."""
+    if neg_per_pos is None:
+        return df
+    r = max(1, int(neg_per_pos))
+    stats: list[tuple[object, int, int]] = []
+    for _cid, g in df.groupby(ccol, sort=False):
+        pos_c = int((g[ycol] == 1).sum())
+        neg_c = int((g[ycol] == 0).sum())
+        stats.append((_cid, pos_c, neg_c))
+    if not stats:
+        return df
+    m = min(min(pos_c, (neg_c // r) if r else pos_c) for _cid, pos_c, neg_c in stats)
+    if m <= 0:
+        return df
+    parts: list[pd.DataFrame] = []
+    for i, (_cid, g) in enumerate(df.groupby(ccol, sort=False)):
+        pos = g[g[ycol] == 1]
+        neg = g[g[ycol] == 0]
+        rs_p, rs_n = rs + 3 * i, rs + 3 * i + 1
+        parts.append(
+            pd.concat(
+                [pos.sample(n=m, random_state=rs_p), neg.sample(n=m * r, random_state=rs_n)],
+                ignore_index=True,
+            )
+        )
+    return pd.concat(parts, ignore_index=True) if parts else df.iloc[:0]
+
+
+def _maybe_downsample_frames(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    cfg: PipelineConfig,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    tc = cfg.train
+    ycol = cfg.features.label_col
+    ccol = cfg.features.client_id_col
+
+    if ccol not in train_df.columns or ccol not in val_df.columns:
+        return train_df, val_df
+
+    r = getattr(tc, "downsample_neg_per_pos", None)
+    rs = int(getattr(tc, "downsample_random_state", 42))
+    eq = bool(getattr(tc, "downsample_equalize_client_rows", True))
+
+    if bool(getattr(tc, "downsample_train", False)):
+        before = len(train_df)
+        work = _balance_train_per_client(train_df, r, ycol=ycol, ccol=ccol, rs=rs)
+        if r is not None and eq:
+            work = _equalize_clients_to_min_rows_keep_ratio(work, r, ycol=ycol, ccol=ccol, rs=rs + 1000)
+        train_df = work.sample(frac=1.0, random_state=rs).reset_index(drop=True)
+        print(
+            f"[downsample] train: {before:,} -> {len(train_df):,} "
+            f"(neg:pos={r}:1, equalize={eq})"
+        )
+
+    if bool(getattr(tc, "downsample_val", False)):
+        before = len(val_df)
+        work = _balance_train_per_client(val_df, r, ycol=ycol, ccol=ccol, rs=rs + 7)
+        if r is not None and eq:
+            work = _equalize_clients_to_min_rows_keep_ratio(work, r, ycol=ycol, ccol=ccol, rs=rs + 2000)
+        val_df = work.sample(frac=1.0, random_state=rs + 7).reset_index(drop=True)
+        print(
+            f"[downsample] val: {before:,} -> {len(val_df):,} "
+            f"(neg:pos={r}:1, equalize={eq})"
+        )
+
+    return train_df, val_df
+
+
 def merge_client_metadata_into_frames(
     train_df: pd.DataFrame,
     val_df: pd.DataFrame,
@@ -150,6 +267,8 @@ def load_train_validation_frames(cfg: PipelineConfig) -> tuple[pd.DataFrame, pd.
             f"Train data missing label column {cfg.features.label_col!r}. "
             f"Columns: {list(train_df.columns)[:40]} ..."
         )
+
+    train_df, val_df = _maybe_downsample_frames(train_df, val_df, cfg)
 
     print("Train shape:", train_df.shape)
     print("Val shape:", val_df.shape)

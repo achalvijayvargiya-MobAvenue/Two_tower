@@ -2,7 +2,7 @@ paths:
   train: "s3://mobavenue-simplismart-aws-s3-apse-sg/rtb/data/two_tower_ml/combined_data/training_data_final/"
   val: "s3://mobavenue-simplismart-aws-s3-apse-sg/rtb/data/two_tower_ml/combined_data/validation_data_final/"
   infer: "s3://mobavenue-simplismart-aws-s3-apse-sg/rtb/data/two_tower_ml/test_data_final/20260416_full/"
-  artifacts_base: "s3://mobavenue-simplismart-aws-s3-apse-sg/rtb/data/two_tower_ml/"
+  artifacts_base: "s3://mobavenue-simplismart-aws-s3-apse-sg/rtb/data/two_tower_ml/3_Client/"
 
 features:
   label_col: "label"
@@ -190,7 +190,7 @@ train:
   client_mlp_hidden: [128, 128]
 
 infer:
-  topk_clients: 1
+  topk_clients: 3
   infer_stream_batch_rows: 65536
   num_physical_gpus: 1
   workers_per_gpu: 1
