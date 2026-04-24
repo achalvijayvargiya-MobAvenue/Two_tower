@@ -102,6 +102,22 @@ def _debug_one_user(
         logits_all = (uemb @ client_emb_t.T).float()
         scores_all = torch.sigmoid(logits_all)
     lines.append(f"logits_all_stats={_tensor_stats(logits_all)} scores_all_stats={_tensor_stats(scores_all)}")
+    # Per-client: which columns are NaN (same row index 0 — one user vs all clients).
+    try:
+        la = logits_all.detach().float().cpu().numpy().reshape(-1)
+        sa = scores_all.detach().float().cpu().numpy().reshape(-1)
+        nan_idx = [int(i) for i, v in enumerate(la) if np.isnan(v)]
+        lines.append(
+            f"logits_nan_client_indices={nan_idx} "
+            f"logits_nan_client_ids={[client_ids_np[i].item() if hasattr(client_ids_np[i], 'item') else client_ids_np[i] for i in nan_idx]}"
+        )
+        lines.append(
+            f"scores_nan_client_indices={nan_idx} "
+            f"scores_nan_client_ids={[client_ids_np[i].item() if hasattr(client_ids_np[i], 'item') else client_ids_np[i] for i in nan_idx]}"
+        )
+        lines.append(f"logits_per_client={la.tolist()} scores_per_client={sa.tolist()}")
+    except Exception as _e:
+        lines.append(f"per_client_nan_breakdown_failed={repr(_e)}")
 
     k = min(int(topk), int(scores_all.shape[1]))
     top_scores, top_idx = torch.topk(scores_all, k=k, dim=1)
@@ -430,6 +446,7 @@ def tt_infer_worker(
             users_this_file = 0
             debug_lines: list[str] = []
             last_write_debug.clear()
+            stop_after_device = False
             if DEBUG_DEVICE_ID:
                 debug_lines.append(f"runtime to_device={to_device.type} use_amp={use_amp} amp_dtype={amp_dtype_str}")
 
@@ -541,18 +558,20 @@ def tt_infer_worker(
                         except Exception as _e:
                             debug_lines.append(f"out_df_score_debug_failed={repr(_e)}")
                     if DEBUG_DEVICE_ID and users_this_file > 0:
-                        pending = None
-                        break
+                        stop_after_device = True
                     del out_df
                     gc.collect()
+                    if stop_after_device:
+                        break
                 t0 = time.time()
                 if max_users_per_file is not None and users_this_file >= int(max_users_per_file):
                     break
-                if DEBUG_DEVICE_ID and users_this_file > 0:
+                if stop_after_device:
                     break
 
             if (
-                pending is not None
+                not stop_after_device
+                and pending is not None
                 and len(pending) > 0
                 and (max_users_per_file is None or users_this_file < int(max_users_per_file))
             ):
@@ -594,6 +613,8 @@ def tt_infer_worker(
                                 client_ids_np=client_ids_np,
                                 topk=topk,
                                 to_device=to_device,
+                                use_amp=use_amp,
+                                amp_dtype_torch=amp_dtype_torch,
                             )
                         except Exception as _e:
                             debug_lines = [f"debug failed: {repr(_e)}"]

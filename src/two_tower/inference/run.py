@@ -43,7 +43,7 @@ def run_inference_job(cfg: InferJobConfig) -> None:
             )
 
     # Debug flow: locate the first file that contains the target device id, then run
-    # inference only on that one file (so we don't read/score all inputs).
+    # inference only on that one ile (so we don't read/score all inputs).
     if DEBUG_DEVICE_ID:
         import pyarrow as pa
         import pyarrow.compute as pc
