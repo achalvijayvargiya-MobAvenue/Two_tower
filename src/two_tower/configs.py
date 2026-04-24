@@ -45,6 +45,16 @@ class TrainConfig:
     num_workers: int
     device: str  # "cuda" or "cpu"
 
+    # Performance / distributed (all optional; defaults preserve current behavior)
+    # If torch.distributed env vars are set (WORLD_SIZE>1), training will use DDP automatically.
+    dataloader_pin_memory: bool = True
+    dataloader_persistent_workers: bool = True
+    dataloader_prefetch_factor: int = 2
+
+    # Optional compile (PyTorch 2.x). Keeps FP32 math; can be disabled if unstable.
+    torch_compile: bool = False
+    torch_compile_mode: str = "reduce-overhead"
+
     # Hash embedding init for categorical columns (reference: PRETRAINED_EMB_DIM)
     pretrained_emb_dim: int = 128
     pretrained_cat_emb_dim: int = 64

@@ -4,6 +4,8 @@ import io
 import math
 import pickle
 import time
+import os
+import contextlib
 from pathlib import Path
 from typing import Union
 
@@ -13,6 +15,8 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.distributed as dist
+from torch.utils.data.distributed import DistributedSampler
 from sklearn.metrics import (
     accuracy_score,
     average_precision_score,
@@ -42,6 +46,44 @@ def _resolve_device(train_device: str) -> torch.device:
     if train_device == "cuda" and not torch.cuda.is_available():
         return torch.device("cpu")
     return torch.device(train_device)
+
+
+def _dist_env() -> tuple[bool, int, int, int]:
+    """
+    Read torchrun/SageMaker DDP env vars.
+
+    Returns: (is_distributed, rank, world_size, local_rank)
+    """
+    world_size = int(os.environ.get("WORLD_SIZE", "1") or "1")
+    rank = int(os.environ.get("RANK", "0") or "0")
+    local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("SM_LOCAL_RANK", "0")) or "0")
+    return (world_size > 1, rank, world_size, local_rank)
+
+
+def _is_rank0() -> bool:
+    is_dist, rank, _, _ = _dist_env()
+    return (not is_dist) or (rank == 0)
+
+
+def _all_gather_1d_cpu(x: torch.Tensor) -> torch.Tensor:
+    """
+    All-gather a 1D CPU tensor across ranks and return concatenated CPU tensor.
+    """
+    if not (dist.is_available() and dist.is_initialized()):
+        return x
+    x = x.contiguous()
+    ws = dist.get_world_size()
+    n_local = torch.tensor([x.numel()], dtype=torch.long)
+    sizes = [torch.zeros((1,), dtype=torch.long) for _ in range(ws)]
+    dist.all_gather(sizes, n_local)
+    sizes_i = [int(s.item()) for s in sizes]
+    max_n = max(sizes_i) if sizes_i else int(x.numel())
+    padded = torch.zeros((max_n,), dtype=x.dtype)
+    padded[: x.numel()] = x
+    gathered = [torch.empty((max_n,), dtype=x.dtype) for _ in range(ws)]
+    dist.all_gather(gathered, padded)
+    out = [g[:n] for g, n in zip(gathered, sizes_i)]
+    return torch.cat(out, dim=0)
 
 
 def _write_bytes(uri: str, data: bytes) -> None:
@@ -146,13 +188,19 @@ def train_and_log(
     if not isinstance(cfg, PipelineConfig):
         cfg = load_pipeline_config(cfg)
 
+    is_dist, rank, world_size, local_rank = _dist_env()
+
     if train_df is None or val_df is None:
         train_df, val_df = load_train_validation_frames(cfg)
 
-    print(f"[train_and_log] train={train_df.shape} val={val_df.shape}")
-    print(f"[train_and_log] run log: {runlog.path}")
-    runlog.write(f"CONFIG experiment={cfg.train.experiment_name} device={cfg.train.device} epochs={cfg.train.epochs}")
-    runlog.write(f"DATA train_rows={train_df.shape[0]} val_rows={val_df.shape[0]}")
+    if _is_rank0():
+        print(f"[train_and_log] train={train_df.shape} val={val_df.shape}")
+        print(f"[train_and_log] run log: {runlog.path}")
+        runlog.write(
+            f"CONFIG experiment={cfg.train.experiment_name} device={cfg.train.device} "
+            f"epochs={cfg.train.epochs} world_size={world_size}"
+        )
+        runlog.write(f"DATA train_rows={train_df.shape[0]} val_rows={val_df.shape[0]}")
 
     if feature_artifacts is None:
         feature_artifacts = prepare_training_features(train_df, val_df, cfg)
@@ -165,22 +213,61 @@ def train_and_log(
     np.random.seed(tc.seed % (2**32 - 1))
 
     device = _resolve_device(tc.device)
+    if is_dist:
+        if device.type == "cuda":
+            torch.cuda.set_device(local_rank)
+            device = torch.device("cuda", local_rank)
+            backend = "nccl"
+        else:
+            backend = "gloo"
+        if dist.is_available() and not dist.is_initialized():
+            dist.init_process_group(backend=backend)
     train_ds = TwoTowerDataset(train_df, fa, label_col=fc.label_col, multi_max_tokens=tc.multi_max_tokens)
     val_ds = TwoTowerDataset(val_df, fa, label_col=fc.label_col, multi_max_tokens=tc.multi_max_tokens)
 
+    # Keep global batch size constant across DDP ranks.
+    if is_dist:
+        if tc.batch_size % world_size != 0:
+            raise ValueError(
+                f"train.batch_size (global) must be divisible by world_size. "
+                f"Got batch_size={tc.batch_size} world_size={world_size}."
+            )
+        per_rank_bs = tc.batch_size // world_size
+    else:
+        per_rank_bs = tc.batch_size
+
+    pin_memory = bool(getattr(tc, "dataloader_pin_memory", True)) and (device.type == "cuda")
+    persistent_workers = bool(getattr(tc, "dataloader_persistent_workers", True)) and (tc.num_workers > 0)
+    prefetch_factor = int(getattr(tc, "dataloader_prefetch_factor", 2))
+    prefetch_factor = max(prefetch_factor, 1)
+
+    train_sampler = None
+    val_sampler = None
+    if is_dist:
+        train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True, seed=tc.seed)
+        val_sampler = DistributedSampler(val_ds, num_replicas=world_size, rank=rank, shuffle=False, seed=tc.seed)
+
     train_loader = DataLoader(
         train_ds,
-        batch_size=tc.batch_size,
-        shuffle=True,
+        batch_size=per_rank_bs,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         num_workers=tc.num_workers,
         collate_fn=collate_fn,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor if tc.num_workers > 0 else None,
     )
     val_loader = DataLoader(
         val_ds,
-        batch_size=tc.batch_size,
+        batch_size=per_rank_bs,
         shuffle=False,
+        sampler=val_sampler,
         num_workers=tc.num_workers,
         collate_fn=collate_fn,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor if tc.num_workers > 0 else None,
     )
 
     user_vocab_sizes = [fa.user_vocabs[c].size for c in fa.user_cat_cols]
@@ -199,25 +286,47 @@ def train_and_log(
     use_pt = bool(fa.user_cat_pretrained_weights) and bool(fa.client_cat_pretrained_weights)
     model = build_two_tower_model(fa, cfg).to(device)
 
-    if use_pt:
-        n_frozen = sum(not any(p.requires_grad for p in emb.parameters()) for emb in model.user_tower.user_cat.embs)
+    if getattr(tc, "torch_compile", False):
+        try:
+            model = torch.compile(model, mode=str(getattr(tc, "torch_compile_mode", "reduce-overhead")))
+        except Exception as e:
+            if _is_rank0():
+                print(f"torch.compile disabled due to error: {e!r}")
+
+    if is_dist:
+        model = torch.nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[device.index] if device.type == "cuda" else None,
+            output_device=device.index if device.type == "cuda" else None,
+            broadcast_buffers=False,
+        )
+
+    m = model.module if hasattr(model, "module") else model
+
+    if use_pt and _is_rank0():
+        n_frozen = sum(not any(p.requires_grad for p in emb.parameters()) for emb in m.user_tower.user_cat.embs)
         print(
             f"Model: pretrained cat embeddings ({'frozen' if tc.freeze_pretrained_base else 'fine-tunable'} base, "
-            f"{tc.pretrained_cat_emb_dim}-dim projection). Frozen user emb tables: {n_frozen}/{len(model.user_tower.user_cat.embs)}."
+            f"{tc.pretrained_cat_emb_dim}-dim projection). Frozen user emb tables: {n_frozen}/{len(m.user_tower.user_cat.embs)}."
         )
-    else:
+    elif _is_rank0():
         print("Model: random-init categorical embeddings.")
 
     criterion = nn.BCEWithLogitsLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=tc.lr, weight_decay=tc.weight_decay)
 
-    setup_mlflow(cfg.mlflow_tracking_uri, tc.experiment_name)
+    if _is_rank0():
+        setup_mlflow(cfg.mlflow_tracking_uri, tc.experiment_name)
 
     try:
-        with mlflow.start_run(run_name=tc.run_name):
-            mlflow.log_params(
-                {
-                    "batch_size": tc.batch_size,
+        mlflow_ctx = mlflow.start_run(run_name=tc.run_name) if _is_rank0() else contextlib.nullcontext()
+        with mlflow_ctx:
+            if _is_rank0():
+                mlflow.log_params(
+                    {
+                        "batch_size_global": tc.batch_size,
+                        "batch_size_per_rank": per_rank_bs,
+                        "world_size": world_size,
                     "lr": tc.lr,
                     "weight_decay": tc.weight_decay,
                     "epochs": tc.epochs,
@@ -236,8 +345,10 @@ def train_and_log(
                     "pretrained_cat_emb_dim": tc.pretrained_cat_emb_dim,
                     "freeze_pretrained_base": tc.freeze_pretrained_base,
                     "use_pretrained_cat": use_pt,
-                }
-            )
+                    "torch_compile": bool(getattr(tc, "torch_compile", False)),
+                    "torch_compile_mode": str(getattr(tc, "torch_compile_mode", "reduce-overhead")),
+                    }
+                )
 
             best_val_auc = float("-inf")
             best_epoch = -1
@@ -257,16 +368,20 @@ def train_and_log(
                 train_labels: list[np.ndarray] = []
                 train_eval_kept = 0
 
-                for batch in train_loader:
-                    user_cat = batch.user_cat.to(device)
-                    user_num = batch.user_num.to(device)
-                    user_multi = batch.user_multi.to(device)
-                    client_cat = batch.client_cat.to(device)
-                    client_num = batch.client_num.to(device)
-                    client_multi = batch.client_multi.to(device)
-                    labels = batch.label.to(device)
+                if is_dist and train_sampler is not None:
+                    train_sampler.set_epoch(epoch)
 
-                    optimizer.zero_grad()
+                for batch in train_loader:
+                    nb = bool(pin_memory)
+                    user_cat = batch.user_cat.to(device, non_blocking=nb)
+                    user_num = batch.user_num.to(device, non_blocking=nb)
+                    user_multi = batch.user_multi.to(device, non_blocking=nb)
+                    client_cat = batch.client_cat.to(device, non_blocking=nb)
+                    client_num = batch.client_num.to(device, non_blocking=nb)
+                    client_multi = batch.client_multi.to(device, non_blocking=nb)
+                    labels = batch.label.to(device, non_blocking=nb)
+
+                    optimizer.zero_grad(set_to_none=True)
                     logits, _, _ = model(user_cat, user_num, client_cat, client_num, user_multi, client_multi)
                     loss = criterion(logits, labels)
                     loss.backward()
@@ -285,15 +400,16 @@ def train_and_log(
                             train_eval_kept += keep
                     now = time.time()
                     if now - last_hb >= hb_every_s:
-                        runlog.write(
-                            f"HEARTBEAT epoch={epoch + 1}/{tc.epochs} seen={total_count} "
-                            f"avg_loss={total_loss / max(total_count, 1):.6f}"
-                        )
+                        if _is_rank0():
+                            runlog.write(
+                                f"HEARTBEAT epoch={epoch + 1}/{tc.epochs} seen={total_count} "
+                                f"avg_loss={total_loss / max(total_count, 1):.6f}"
+                            )
                         last_hb = now
 
                 avg_train_loss = total_loss / max(total_count, 1)
                 train_metrics: dict[str, float] | None = None
-                if train_eval_max > 0 and train_eval_kept > 0:
+                if train_eval_max > 0 and train_eval_kept > 0 and _is_rank0():
                     ytr = np.concatenate(train_labels, axis=0)
                     yts = np.concatenate(train_scores, axis=0)
                     train_metrics = _binary_metrics(ytr, yts, threshold=0.5)
@@ -308,13 +424,14 @@ def train_and_log(
                 all_labels: list[torch.Tensor] = []
                 with torch.no_grad():
                     for batch in val_loader:
-                        user_cat = batch.user_cat.to(device)
-                        user_num = batch.user_num.to(device)
-                        user_multi = batch.user_multi.to(device)
-                        client_cat = batch.client_cat.to(device)
-                        client_num = batch.client_num.to(device)
-                        client_multi = batch.client_multi.to(device)
-                        labels = batch.label.to(device)
+                        nb = bool(pin_memory)
+                        user_cat = batch.user_cat.to(device, non_blocking=nb)
+                        user_num = batch.user_num.to(device, non_blocking=nb)
+                        user_multi = batch.user_multi.to(device, non_blocking=nb)
+                        client_cat = batch.client_cat.to(device, non_blocking=nb)
+                        client_num = batch.client_num.to(device, non_blocking=nb)
+                        client_multi = batch.client_multi.to(device, non_blocking=nb)
+                        labels = batch.label.to(device, non_blocking=nb)
 
                         logits, uemb, cemb = model(
                             user_cat, user_num, client_cat, client_num, user_multi, client_multi
@@ -327,26 +444,53 @@ def train_and_log(
                         val_logits_nonfinite += int((~torch.isfinite(logits)).sum().item())
                         val_loss += loss.item() * bs
                         val_count += bs
-                        all_logits.append(logits.cpu())
-                        all_labels.append(labels.cpu())
+                        all_logits.append(logits.detach().cpu())
+                        all_labels.append(labels.detach().cpu())
 
                 avg_val_loss = val_loss / max(val_count, 1)
-                y_true = torch.cat(all_labels).numpy().ravel()
-                y_score = torch.cat(all_logits).numpy().ravel()
-                val_metrics = _binary_metrics(y_true, y_score, threshold=0.5)
-                val_auc = float(val_metrics["auc_roc"])
+                local_y_true = torch.cat(all_labels).view(-1)
+                local_y_score = torch.cat(all_logits).view(-1)
+                if is_dist and dist.is_initialized():
+                    y_true_t = _all_gather_1d_cpu(local_y_true)
+                    y_score_t = _all_gather_1d_cpu(local_y_score)
+                else:
+                    y_true_t = local_y_true
+                    y_score_t = local_y_score
+
+                if _is_rank0():
+                    y_true = y_true_t.numpy()
+                    y_score = y_score_t.numpy()
+                    val_metrics = _binary_metrics(y_true, y_score, threshold=0.5)
+                    val_auc = float(val_metrics["auc_roc"])
+                else:
+                    val_metrics = {
+                        "auc_roc": float("nan"),
+                        "auc_pr": float("nan"),
+                        "precision": float("nan"),
+                        "recall": float("nan"),
+                        "f1": float("nan"),
+                        "accuracy": float("nan"),
+                        "logloss": float("nan"),
+                        "label_pos_rate": float("nan"),
+                        "tn": float("nan"),
+                        "fp": float("nan"),
+                        "fn": float("nan"),
+                        "tp": float("nan"),
+                    }
+                    val_auc = float("nan")
 
                 if np.isfinite(val_auc) and val_auc > best_val_auc:
                     best_val_auc = val_auc
                 best_epoch = epoch
                 best_snapshot = {
-                    "user_tower": {k: v.detach().cpu().clone() for k, v in model.user_tower.state_dict().items()},
-                    "client_tower": {k: v.detach().cpu().clone() for k, v in model.client_tower.state_dict().items()},
-                    "log_scale": model.log_scale.detach().cpu().clone(),
+                    "user_tower": {k: v.detach().cpu().clone() for k, v in m.user_tower.state_dict().items()},
+                    "client_tower": {k: v.detach().cpu().clone() for k, v in m.client_tower.state_dict().items()},
+                    "log_scale": m.log_scale.detach().cpu().clone(),
                 }
-                print(f"  -> new best val_auc={best_val_auc:.4f} (epoch {epoch + 1})")
+                if _is_rank0():
+                    print(f"  -> new best val_auc={best_val_auc:.4f} (epoch {epoch + 1})")
 
-            _scale_val = model.log_scale.clamp(math.log(1.0), math.log(100.0)).exp().item()
+            _scale_val = m.log_scale.clamp(math.log(1.0), math.log(100.0)).exp().item()
             metrics_to_log = {
                 "train_loss": avg_train_loss,
                 "val_loss": avg_val_loss,
@@ -381,153 +525,161 @@ def train_and_log(
                         "train_label_pos_rate": float(train_metrics["label_pos_rate"]),
                     }
                 )
-            mlflow.log_metrics(metrics_to_log, step=epoch)
+            if _is_rank0():
+                mlflow.log_metrics(metrics_to_log, step=epoch)
 
-            print(
-                f"Epoch {epoch + 1}/{tc.epochs} | train_loss={avg_train_loss:.4f} | "
-                f"val_loss={avg_val_loss:.4f} | val_auc={val_metrics['auc_roc']:.4f} | "
-                f"val_pr_auc={val_metrics['auc_pr']:.4f} | "
-                f"val_prec={val_metrics['precision']:.4f} val_rec={val_metrics['recall']:.4f} "
-                f"val_f1={val_metrics['f1']:.4f} | scale={_scale_val:.2f} | "
-                f"val_nonfinite uemb={val_uemb_bad} cemb={val_cemb_bad} logits={val_logits_nonfinite}"
-            )
-            if train_metrics is not None:
+            if _is_rank0():
                 print(
-                    f"           train_auc={train_metrics['auc_roc']:.4f} train_pr_auc={train_metrics['auc_pr']:.4f} "
-                    f"train_prec={train_metrics['precision']:.4f} train_rec={train_metrics['recall']:.4f} "
-                    f"train_f1={train_metrics['f1']:.4f} (sample_n={train_eval_kept})"
+                    f"Epoch {epoch + 1}/{tc.epochs} | train_loss={avg_train_loss:.4f} | "
+                    f"val_loss={avg_val_loss:.4f} | val_auc={val_metrics['auc_roc']:.4f} | "
+                    f"val_pr_auc={val_metrics['auc_pr']:.4f} | "
+                    f"val_prec={val_metrics['precision']:.4f} val_rec={val_metrics['recall']:.4f} "
+                    f"val_f1={val_metrics['f1']:.4f} | scale={_scale_val:.2f} | "
+                    f"val_nonfinite uemb={val_uemb_bad} cemb={val_cemb_bad} logits={val_logits_nonfinite}"
                 )
-            runlog.write(
-                "EPOCH_DONE "
-                f"epoch={epoch + 1}/{tc.epochs} "
-                f"train_loss={avg_train_loss:.6f} "
-                f"val_loss={avg_val_loss:.6f} "
-                f"val_auc={val_metrics['auc_roc']:.6f} val_auc_pr={val_metrics['auc_pr']:.6f} "
-                f"val_prec={val_metrics['precision']:.6f} val_rec={val_metrics['recall']:.6f} "
-                f"val_f1={val_metrics['f1']:.6f} val_acc={val_metrics['accuracy']:.6f} "
-                f"val_logloss={val_metrics['logloss']:.6f} "
-                f"val_cm_tn={int(val_metrics['tn'])} val_cm_fp={int(val_metrics['fp'])} "
-                f"val_cm_fn={int(val_metrics['fn'])} val_cm_tp={int(val_metrics['tp'])}"
+                if train_metrics is not None:
+                    print(
+                        f"           train_auc={train_metrics['auc_roc']:.4f} train_pr_auc={train_metrics['auc_pr']:.4f} "
+                        f"train_prec={train_metrics['precision']:.4f} train_rec={train_metrics['recall']:.4f} "
+                        f"train_f1={train_metrics['f1']:.4f} (sample_n={train_eval_kept})"
+                    )
+                runlog.write(
+                    "EPOCH_DONE "
+                    f"epoch={epoch + 1}/{tc.epochs} "
+                    f"train_loss={avg_train_loss:.6f} "
+                    f"val_loss={avg_val_loss:.6f} "
+                    f"val_auc={val_metrics['auc_roc']:.6f} val_auc_pr={val_metrics['auc_pr']:.6f} "
+                    f"val_prec={val_metrics['precision']:.6f} val_rec={val_metrics['recall']:.6f} "
+                    f"val_f1={val_metrics['f1']:.6f} val_acc={val_metrics['accuracy']:.6f} "
+                    f"val_logloss={val_metrics['logloss']:.6f} "
+                    f"val_cm_tn={int(val_metrics['tn'])} val_cm_fp={int(val_metrics['fp'])} "
+                    f"val_cm_fn={int(val_metrics['fn'])} val_cm_tp={int(val_metrics['tp'])}"
+                )
+
+        if _is_rank0():
+            if best_snapshot is not None:
+                best_user_state = best_snapshot["user_tower"]
+                best_client_state = best_snapshot["client_tower"]
+                ckpt_selection = "best_val_auc"
+                mlflow.log_metrics({"best_val_auc": best_val_auc, "best_epoch": float(best_epoch)}, step=tc.epochs)
+                print(
+                    f"Best epoch: {best_epoch + 1}/{tc.epochs} val_auc={best_val_auc:.4f} "
+                    "(weights exported to artifacts + MLflow)."
+                )
+            else:
+                best_user_state = {k: v.detach().cpu().clone() for k, v in m.user_tower.state_dict().items()}
+                best_client_state = {k: v.detach().cpu().clone() for k, v in m.client_tower.state_dict().items()}
+                ckpt_selection = "last_epoch"
+                print("No val_auc improvement recorded; exporting last-epoch towers.")
+
+            m.user_tower.load_state_dict({k: v.to(device) for k, v in best_user_state.items()})
+            m.client_tower.load_state_dict({k: v.to(device) for k, v in best_client_state.items()})
+            if best_snapshot is not None and "log_scale" in best_snapshot:
+                m.log_scale.data.copy_(best_snapshot["log_scale"].to(device))
+
+            _ex = next(iter(val_loader))
+            input_example = [
+                _ex.user_cat.numpy(),
+                _ex.user_num.numpy(),
+                _ex.user_multi.numpy(),
+                _ex.client_cat.numpy(),
+                _ex.client_num.numpy(),
+                _ex.client_multi.numpy(),
+            ]
+            try:
+                mlflow.pytorch.log_model(
+                    m,
+                    name="model",
+                    input_example=input_example,
+                    serialization_format="pt2",
+                )
+            except Exception as e:
+                print(f"MLflow pt2 export failed ({e!r}); falling back to pickle serialization.")
+                mlflow.pytorch.log_model(m, name="model", input_example=input_example)
+
+            base = cfg.paths.artifacts_base
+            user_tower_uri = artifact_uri(base, "artifacts", "user_tower", "user_tower_state.pt")
+            vocab_uri = artifact_uri(base, "artifacts", "vocab_artifact", "vocab_artifact.pkl")
+            client_emb_uri = artifact_uri(base, "artifacts", "client_embeddings", "client_embeddings.parquet")
+
+            user_multi_vocab_sizes = [fa.user_multi_vocabs[c].size for c in fa.user_multi_cols]
+            user_multi_emb_dims = [embedding_dim_for_cardinality(v) for v in user_multi_vocab_sizes]
+
+            user_ckpt = {
+                "state_dict": best_user_state,
+                "emb_dim": tc.embed_dim,
+                "user_vocab_sizes": user_vocab_sizes,
+                "user_num_dim": user_num_dim,
+                "user_multi_vocab_sizes": user_multi_vocab_sizes,
+                "user_multi_emb_dims": user_multi_emb_dims,
+                "user_multi_cols": fa.user_multi_cols,
+                "multi_cat_max_tokens": tc.multi_max_tokens,
+                "multi_cat_pool": tc.multi_cat_pool,
+                "num_cross_layers": tc.dcn_cross_layers,
+                "user_deep_hidden": list(tc.mlp_hidden_dims),
+                "log_scale": float(m.log_scale.item()),
+                "checkpoint_selection": ckpt_selection,
+                "best_val_auc": float(best_val_auc) if best_snapshot is not None else None,
+                "best_epoch_0based": int(best_epoch) if best_snapshot is not None else None,
+                "use_pretrained_cat": use_pt,
+                "pretrained_emb_dim": tc.pretrained_emb_dim,
+                "target_cat_emb_dim": tc.pretrained_cat_emb_dim,
+                "freeze_base": tc.freeze_pretrained_base,
+            }
+            _ubuf = io.BytesIO()
+            torch.save(user_ckpt, _ubuf)
+            _write_bytes(user_tower_uri, _ubuf.getvalue())
+            print(f"Saved user tower to: {user_tower_uri} (selection={ckpt_selection})")
+
+            vocab_artifact = {
+                "user_vocabs": {k: vocab_to_dict(v) for k, v in fa.user_vocabs.items()},
+                "user_multi_vocabs": {k: vocab_to_dict(v) for k, v in fa.user_multi_vocabs.items()},
+                "user_cat_cols": fa.user_cat_cols,
+                "user_num_cols": fa.user_num_cols,
+                "user_multi_cols": fa.user_multi_cols,
+                "device_id_col": fc.device_id_col,
+                "multi_cat_max_tokens": tc.multi_max_tokens,
+                "multi_cat_pool": tc.multi_cat_pool,
+            }
+            _vbuf = io.BytesIO()
+            pickle.dump(vocab_artifact, _vbuf, protocol=pickle.HIGHEST_PROTOCOL)
+            _write_bytes(vocab_uri, _vbuf.getvalue())
+            print(f"Saved vocab artifact to: {vocab_uri}")
+
+            client_id_col = _resolve_client_id_column(train_df, fc.client_id_col)
+            client_df = train_df.drop_duplicates(subset=[client_id_col]).copy()
+            client_df["client_id"] = client_df[client_id_col]
+
+            from two_tower.features.encode import encode_cats, encode_multi_matrix, encode_nums
+
+            m.client_tower.eval()
+            _client_cat = encode_cats(client_df, fa.client_cat_cols, fa.client_vocabs)
+            _client_num = encode_nums(client_df, fa.client_num_cols)
+            _client_multi = encode_multi_matrix(
+                client_df, fa.client_multi_cols, fa.client_multi_vocabs, tc.multi_max_tokens
             )
+            embs: list[np.ndarray] = []
+            with torch.no_grad():
+                for start in range(0, len(client_df), tc.batch_size):
+                    end = start + tc.batch_size
+                    cc = _client_cat[start:end].to(device)
+                    cn = _client_num[start:end].to(device)
+                    cm = _client_multi[start:end].to(device)
+                    emb = m.client_tower(cc, cn, cm).cpu().numpy().astype("float32")
+                    embs.append(emb)
+            client_emb_matrix = np.concatenate(embs, axis=0)
+            out_df = pd.DataFrame({"client_id": client_df["client_id"].values})
+            out_df["embedding"] = [row.tolist() for row in client_emb_matrix]
+            out_df.to_parquet(client_emb_uri, index=False)
+            print(f"Wrote client embeddings to: {client_emb_uri}")
 
-        if best_snapshot is not None:
-            best_user_state = best_snapshot["user_tower"]
-            best_client_state = best_snapshot["client_tower"]
-            ckpt_selection = "best_val_auc"
-            mlflow.log_metrics({"best_val_auc": best_val_auc, "best_epoch": float(best_epoch)}, step=tc.epochs)
-            print(
-                f"Best epoch: {best_epoch + 1}/{tc.epochs} val_auc={best_val_auc:.4f} "
-                "(weights exported to artifacts + MLflow)."
-            )
-        else:
-            best_user_state = {k: v.detach().cpu().clone() for k, v in model.user_tower.state_dict().items()}
-            best_client_state = {k: v.detach().cpu().clone() for k, v in model.client_tower.state_dict().items()}
-            ckpt_selection = "last_epoch"
-            print("No val_auc improvement recorded; exporting last-epoch towers.")
-
-        model.user_tower.load_state_dict({k: v.to(device) for k, v in best_user_state.items()})
-        model.client_tower.load_state_dict({k: v.to(device) for k, v in best_client_state.items()})
-        if best_snapshot is not None and "log_scale" in best_snapshot:
-            model.log_scale.data.copy_(best_snapshot["log_scale"].to(device))
-
-        _ex = next(iter(val_loader))
-        input_example = [
-            _ex.user_cat.numpy(),
-            _ex.user_num.numpy(),
-            _ex.user_multi.numpy(),
-            _ex.client_cat.numpy(),
-            _ex.client_num.numpy(),
-            _ex.client_multi.numpy(),
-        ]
-        try:
-            mlflow.pytorch.log_model(
-                model,
-                name="model",
-                input_example=input_example,
-                serialization_format="pt2",
-            )
-        except Exception as e:
-            print(f"MLflow pt2 export failed ({e!r}); falling back to pickle serialization.")
-            mlflow.pytorch.log_model(model, name="model", input_example=input_example)
-
-        base = cfg.paths.artifacts_base
-        user_tower_uri = artifact_uri(base, "artifacts", "user_tower", "user_tower_state.pt")
-        vocab_uri = artifact_uri(base, "artifacts", "vocab_artifact", "vocab_artifact.pkl")
-        client_emb_uri = artifact_uri(base, "artifacts", "client_embeddings", "client_embeddings.parquet")
-
-        user_multi_vocab_sizes = [fa.user_multi_vocabs[c].size for c in fa.user_multi_cols]
-        user_multi_emb_dims = [embedding_dim_for_cardinality(v) for v in user_multi_vocab_sizes]
-
-        user_ckpt = {
-            "state_dict": best_user_state,
-            "emb_dim": tc.embed_dim,
-            "user_vocab_sizes": user_vocab_sizes,
-            "user_num_dim": user_num_dim,
-            "user_multi_vocab_sizes": user_multi_vocab_sizes,
-            "user_multi_emb_dims": user_multi_emb_dims,
-            "user_multi_cols": fa.user_multi_cols,
-            "multi_cat_max_tokens": tc.multi_max_tokens,
-            "multi_cat_pool": tc.multi_cat_pool,
-            "num_cross_layers": tc.dcn_cross_layers,
-            "user_deep_hidden": list(tc.mlp_hidden_dims),
-            "log_scale": float(model.log_scale.item()),
-            "checkpoint_selection": ckpt_selection,
-            "best_val_auc": float(best_val_auc) if best_snapshot is not None else None,
-            "best_epoch_0based": int(best_epoch) if best_snapshot is not None else None,
-            "use_pretrained_cat": use_pt,
-            "pretrained_emb_dim": tc.pretrained_emb_dim,
-            "target_cat_emb_dim": tc.pretrained_cat_emb_dim,
-            "freeze_base": tc.freeze_pretrained_base,
-        }
-        _ubuf = io.BytesIO()
-        torch.save(user_ckpt, _ubuf)
-        _write_bytes(user_tower_uri, _ubuf.getvalue())
-        print(f"Saved user tower to: {user_tower_uri} (selection={ckpt_selection})")
-
-        vocab_artifact = {
-            "user_vocabs": {k: vocab_to_dict(v) for k, v in fa.user_vocabs.items()},
-            "user_multi_vocabs": {k: vocab_to_dict(v) for k, v in fa.user_multi_vocabs.items()},
-            "user_cat_cols": fa.user_cat_cols,
-            "user_num_cols": fa.user_num_cols,
-            "user_multi_cols": fa.user_multi_cols,
-            "device_id_col": fc.device_id_col,
-            "multi_cat_max_tokens": tc.multi_max_tokens,
-            "multi_cat_pool": tc.multi_cat_pool,
-        }
-        _vbuf = io.BytesIO()
-        pickle.dump(vocab_artifact, _vbuf, protocol=pickle.HIGHEST_PROTOCOL)
-        _write_bytes(vocab_uri, _vbuf.getvalue())
-        print(f"Saved vocab artifact to: {vocab_uri}")
-
-        client_id_col = _resolve_client_id_column(train_df, fc.client_id_col)
-        client_df = train_df.drop_duplicates(subset=[client_id_col]).copy()
-        client_df["client_id"] = client_df[client_id_col]
-
-        from two_tower.features.encode import encode_cats, encode_multi_matrix, encode_nums
-
-        model.client_tower.eval()
-        _client_cat = encode_cats(client_df, fa.client_cat_cols, fa.client_vocabs)
-        _client_num = encode_nums(client_df, fa.client_num_cols)
-        _client_multi = encode_multi_matrix(
-            client_df, fa.client_multi_cols, fa.client_multi_vocabs, tc.multi_max_tokens
-        )
-        embs: list[np.ndarray] = []
-        with torch.no_grad():
-            for start in range(0, len(client_df), tc.batch_size):
-                end = start + tc.batch_size
-                cc = _client_cat[start:end].to(device)
-                cn = _client_num[start:end].to(device)
-                cm = _client_multi[start:end].to(device)
-                emb = model.client_tower(cc, cn, cm).cpu().numpy().astype("float32")
-                embs.append(emb)
-        client_emb_matrix = np.concatenate(embs, axis=0)
-        out_df = pd.DataFrame({"client_id": client_df["client_id"].values})
-        out_df["embedding"] = [row.tolist() for row in client_emb_matrix]
-        out_df.to_parquet(client_emb_uri, index=False)
-        print(f"Wrote client embeddings to: {client_emb_uri}")
-
-        print("[train_and_log] Done.")
-        runlog.write(f"FINISH ok=true elapsed_s={time.time() - t_start:.1f}")
+            print("[train_and_log] Done.")
+            runlog.write(f"FINISH ok=true elapsed_s={time.time() - t_start:.1f}")
     except Exception as e:
-        runlog.write(f"FINISH ok=false elapsed_s={time.time() - t_start:.1f} error={e!r}")
+        if _is_rank0():
+            runlog.write(f"FINISH ok=false elapsed_s={time.time() - t_start:.1f} error={e!r}")
         raise
+    finally:
+        if is_dist and dist.is_initialized():
+            dist.barrier()
+            dist.destroy_process_group()
