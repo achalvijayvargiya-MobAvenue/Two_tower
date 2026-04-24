@@ -65,22 +65,25 @@ def _is_rank0() -> bool:
     return (not is_dist) or (rank == 0)
 
 
-def _all_gather_1d_cpu(x: torch.Tensor) -> torch.Tensor:
+def _all_gather_1d(x: torch.Tensor) -> torch.Tensor:
     """
-    All-gather a 1D CPU tensor across ranks and return concatenated CPU tensor.
+    All-gather a 1D tensor across ranks and return concatenated tensor.
+
+    Important: for NCCL backend this MUST run on CUDA tensors (not CPU).
     """
     if not (dist.is_available() and dist.is_initialized()):
         return x
     x = x.contiguous()
     ws = dist.get_world_size()
-    n_local = torch.tensor([x.numel()], dtype=torch.long)
-    sizes = [torch.zeros((1,), dtype=torch.long) for _ in range(ws)]
+    device = x.device
+    n_local = torch.tensor([x.numel()], dtype=torch.long, device=device)
+    sizes = [torch.zeros((1,), dtype=torch.long, device=device) for _ in range(ws)]
     dist.all_gather(sizes, n_local)
     sizes_i = [int(s.item()) for s in sizes]
     max_n = max(sizes_i) if sizes_i else int(x.numel())
-    padded = torch.zeros((max_n,), dtype=x.dtype)
+    padded = torch.zeros((max_n,), dtype=x.dtype, device=device)
     padded[: x.numel()] = x
-    gathered = [torch.empty((max_n,), dtype=x.dtype) for _ in range(ws)]
+    gathered = [torch.empty((max_n,), dtype=x.dtype, device=device) for _ in range(ws)]
     dist.all_gather(gathered, padded)
     out = [g[:n] for g, n in zip(gathered, sizes_i)]
     return torch.cat(out, dim=0)
@@ -451,8 +454,9 @@ def train_and_log(
                 local_y_true = torch.cat(all_labels).view(-1)
                 local_y_score = torch.cat(all_logits).view(-1)
                 if is_dist and dist.is_initialized():
-                    y_true_t = _all_gather_1d_cpu(local_y_true)
-                    y_score_t = _all_gather_1d_cpu(local_y_score)
+                    # NCCL does not support CPU collectives: gather on the training device.
+                    y_true_t = _all_gather_1d(local_y_true.to(device, non_blocking=True)).detach().cpu()
+                    y_score_t = _all_gather_1d(local_y_score.to(device, non_blocking=True)).detach().cpu()
                 else:
                     y_true_t = local_y_true
                     y_score_t = local_y_score
