@@ -14,7 +14,6 @@ from two_tower.io.runlog import start_run_log
 
 def run_inference_job(cfg: InferJobConfig) -> None:
     """Spawn workers to rank users against precomputed client embeddings (reference flow)."""
-    DEBUG_DEVICE_ID = "41d8c21e-b325-8e9d-27b2-760d9bab21ab"
     ic = cfg.infer
     runlog = start_run_log(kind="infer", name="two_tower")
     t_start = time.time()
@@ -42,56 +41,12 @@ def run_inference_job(cfg: InferJobConfig) -> None:
                 f"infer.max_files={ic.max_files} filtered out all inputs under {cfg.paths.infer!r}"
             )
 
-    # Debug flow: locate the first file that contains the target device id, then run
-    # inference only on that one ile (so we don't read/score all inputs).
-    if DEBUG_DEVICE_ID:
-        import pyarrow as pa
-        import pyarrow.compute as pc
-        import pyarrow.dataset as pads
-
-        hit: str | None = None
-        for fp in infer_files:
-            try:
-                dset = pads.dataset(fp, format="parquet")
-                if device_id_col not in dset.schema.names:
-                    continue
-                # Stream batches of the device_id column; stop early once found.
-                found = False
-                scanner = pads.Scanner.from_dataset(
-                    dset,
-                    columns=[device_id_col],
-                    batch_size=50_000,
-                )
-                for batch in scanner.to_batches():
-                    col = batch.column(0)
-                    # Robust against non-string physical types.
-                    mask = pc.equal(pc.cast(col, pa.string()), DEBUG_DEVICE_ID)
-                    if bool(pc.any(mask).as_py()):
-                        found = True
-                        break
-                if found:
-                    hit = fp
-                    break
-            except Exception:
-                # If a file can't be scanned (corrupt/permission/etc), just skip it.
-                continue
-
-        if hit is None:
-            raise FileNotFoundError(
-                f"Debug device id {DEBUG_DEVICE_ID!r} not found in any infer file under {cfg.paths.infer!r}"
-            )
-        infer_files = [hit]
-        print(f"[infer][debug] limiting to device_id={DEBUG_DEVICE_ID} in file={hit}")
-        runlog.write(f"DEBUG device_id={DEBUG_DEVICE_ID} file={hit}")
-
     out_dir = ic.ranking_output.rstrip("/")
     if not out_dir.startswith("s3://"):
         Path(out_dir).mkdir(parents=True, exist_ok=True)
     out_prefix = out_dir if out_dir.endswith("/") else out_dir + "/"
 
     num_workers = max(1, int(ic.num_physical_gpus) * max(1, int(ic.workers_per_gpu)))
-    if DEBUG_DEVICE_ID:
-        num_workers = 1
 
     print(f"[infer] {num_workers} workers | {len(infer_files)} files | top-{ic.topk_clients}")
     if ic.max_files is not None or ic.max_users_per_file is not None:
@@ -171,9 +126,6 @@ def run_inference_job(cfg: InferJobConfig) -> None:
             print(f"        {status.get('error')}")
             runlog.write(f"FILE_DONE ok=false file={status.get('file')} worker={status.get('worker')} error={status.get('error')}")
         else:
-            dbg = status.get("debug_lines") or []
-            for line in dbg:
-                runlog.write(f"DEBUG {line}")
             total_read += float(status.get("read_time", 0))
             total_prep += float(status.get("preprocess_time", 0))
             total_inf += float(status.get("inference_time", 0))
