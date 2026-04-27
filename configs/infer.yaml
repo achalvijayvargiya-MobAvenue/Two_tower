@@ -1,6 +1,6 @@
 paths:
   infer: "s3://mobavenue-simplismart-aws-s3-apse-sg/rtb/data/two_tower_ml/test_data_final/20260418_full/"
-  artifacts_base: "s3://mobavenue-simplismart-aws-s3-apse-sg/rtb/data/two_tower_ml/"
+  artifacts_base: "s3://mobavenue-simplismart-aws-s3-apse-sg/rtb/data/two_tower_ml/3_Client/"
 
 features:
   device_id_col: "device_id"
@@ -8,11 +8,11 @@ features:
   user_multi_cols: []
 
 infer:
-  topk_clients: 2
+  topk_clients: 3
   infer_stream_batch_rows: 65536
   num_physical_gpus: 4
   workers_per_gpu: 3
-  ranking_output: "s3://mobavenue-simplismart-aws-s3-apse-sg/rtb/data/two_tower_ml/user_client_rankings_1device_Test/"
+  ranking_output: "s3://mobavenue-simplismart-aws-s3-apse-sg/rtb/data/two_tower_ml/user_client_rankings/"
   rank_user_batch: 2048
   client_chunk: 2048
   use_amp: false
