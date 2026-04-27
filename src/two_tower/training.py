@@ -179,6 +179,67 @@ def _binary_metrics(
     return out
 
 
+def _safe_mlflow_key(s: object) -> str:
+    """
+    Make a stable MLflow metric key suffix from a client id (may contain slashes/dots/spaces).
+    """
+    raw = str(s)
+    out = []
+    for ch in raw:
+        if ch.isalnum():
+            out.append(ch)
+        else:
+            out.append("_")
+    cleaned = "".join(out).strip("_")
+    return cleaned[:120] if cleaned else "unknown"
+
+
+def _client_group_metrics(
+    *,
+    val_df: pd.DataFrame,
+    client_id_col: str,
+    row_idx: np.ndarray,
+    y_true: np.ndarray,
+    y_score: np.ndarray,
+) -> tuple[dict[object, dict[str, float]], dict[str, float]]:
+    """
+    Compute per-client metrics by mapping each scored example back to its client id via val_df[row_idx].
+    Returns:
+      - per_client: {client_id: metrics_dict}
+      - summary: {"macro_auc": ..., "worst_client_auc": ...}
+    """
+    if client_id_col not in val_df.columns:
+        return {}, {"macro_auc": float("nan"), "worst_client_auc": float("nan")}
+
+    idx = np.asarray(row_idx, dtype=np.int64).ravel()
+    yt = np.asarray(y_true).ravel()
+    ys = np.asarray(y_score).ravel()
+    if idx.size != yt.size or idx.size != ys.size:
+        raise ValueError(
+            f"client metrics: size mismatch row_idx={idx.size} y_true={yt.size} y_score={ys.size}"
+        )
+
+    # val_df is reset_index(drop=True) inside the dataset; row_idx refers to that 0..N-1 space.
+    client_ids = val_df[client_id_col].reset_index(drop=True).to_numpy()
+    cid_for_row = client_ids[idx]
+
+    per_client: dict[object, dict[str, float]] = {}
+    aucs: list[float] = []
+    for cid in pd.unique(cid_for_row):
+        m = (cid_for_row == cid)
+        if not bool(np.any(m)):
+            continue
+        met = _binary_metrics(yt[m], ys[m], threshold=0.5)
+        per_client[cid] = met
+        a = float(met.get("auc_roc", float("nan")))
+        if np.isfinite(a):
+            aucs.append(a)
+
+    macro_auc = float(np.mean(aucs)) if aucs else float("nan")
+    worst_auc = float(np.min(aucs)) if aucs else float("nan")
+    return per_client, {"macro_auc": macro_auc, "worst_client_auc": worst_auc}
+
+
 def train_and_log(
     *,
     cfg: Union[PipelineConfig, str, Path],
@@ -425,6 +486,7 @@ def train_and_log(
                 val_logits_nonfinite = 0
                 all_logits: list[torch.Tensor] = []
                 all_labels: list[torch.Tensor] = []
+                all_row_idx: list[torch.Tensor] = []
                 with torch.no_grad():
                     for batch in val_loader:
                         nb = bool(pin_memory)
@@ -449,23 +511,35 @@ def train_and_log(
                         val_count += bs
                         all_logits.append(logits.detach().cpu())
                         all_labels.append(labels.detach().cpu())
+                        all_row_idx.append(batch.row_idx.detach().cpu())
 
                 avg_val_loss = val_loss / max(val_count, 1)
                 local_y_true = torch.cat(all_labels).view(-1)
                 local_y_score = torch.cat(all_logits).view(-1)
+                local_row_idx = torch.cat(all_row_idx).view(-1)
                 if is_dist and dist.is_initialized():
                     # NCCL does not support CPU collectives: gather on the training device.
                     y_true_t = _all_gather_1d(local_y_true.to(device, non_blocking=True)).detach().cpu()
                     y_score_t = _all_gather_1d(local_y_score.to(device, non_blocking=True)).detach().cpu()
+                    ridx_t = _all_gather_1d(local_row_idx.to(device, non_blocking=True)).detach().cpu()
                 else:
                     y_true_t = local_y_true
                     y_score_t = local_y_score
+                    ridx_t = local_row_idx
 
                 if _is_rank0():
                     y_true = y_true_t.numpy()
                     y_score = y_score_t.numpy()
+                    row_idx = ridx_t.numpy()
                     val_metrics = _binary_metrics(y_true, y_score, threshold=0.5)
                     val_auc = float(val_metrics["auc_roc"])
+                    per_client_metrics, client_summary = _client_group_metrics(
+                        val_df=val_df,
+                        client_id_col=fc.client_id_col,
+                        row_idx=row_idx,
+                        y_true=y_true,
+                        y_score=y_score,
+                    )
                 else:
                     val_metrics = {
                         "auc_roc": float("nan"),
@@ -482,6 +556,8 @@ def train_and_log(
                         "tp": float("nan"),
                     }
                     val_auc = float("nan")
+                    per_client_metrics = {}
+                    client_summary = {"macro_auc": float("nan"), "worst_client_auc": float("nan")}
 
                 if np.isfinite(val_auc) and val_auc > best_val_auc:
                     best_val_auc = val_auc
@@ -515,7 +591,14 @@ def train_and_log(
                 "val_fp": float(val_metrics["fp"]),
                 "val_fn": float(val_metrics["fn"]),
                 "val_tp": float(val_metrics["tp"]),
+                "val_auc_macro_client": float(client_summary["macro_auc"]),
+                "val_auc_worst_client": float(client_summary["worst_client_auc"]),
             }
+            if _is_rank0() and per_client_metrics:
+                # Log per-client AUCs for debugging/fairness tracking.
+                for cid, met in per_client_metrics.items():
+                    k = _safe_mlflow_key(cid)
+                    metrics_to_log[f"val_auc_client__{k}"] = float(met.get("auc_roc", float("nan")))
             if train_metrics is not None:
                 metrics_to_log.update(
                     {
@@ -536,6 +619,8 @@ def train_and_log(
                 print(
                     f"Epoch {epoch + 1}/{tc.epochs} | train_loss={avg_train_loss:.4f} | "
                     f"val_loss={avg_val_loss:.4f} | val_auc={val_metrics['auc_roc']:.4f} | "
+                    f"val_auc_macro={client_summary['macro_auc']:.4f} "
+                    f"val_auc_worst={client_summary['worst_client_auc']:.4f} | "
                     f"val_pr_auc={val_metrics['auc_pr']:.4f} | "
                     f"val_prec={val_metrics['precision']:.4f} val_rec={val_metrics['recall']:.4f} "
                     f"val_f1={val_metrics['f1']:.4f} | scale={_scale_val:.2f} | "

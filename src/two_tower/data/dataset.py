@@ -13,6 +13,7 @@ class TwoTowerDataset(Dataset):
 
     def __init__(self, df: pd.DataFrame, fa: FeatureArtifacts, *, label_col: str, multi_max_tokens: int):
         df = df.reset_index(drop=True)
+        self.row_idx = torch.arange(len(df), dtype=torch.long)
         self.user_cat = encode_cats(df, fa.user_cat_cols, fa.user_vocabs)
         self.user_num = encode_nums(df, fa.user_num_cols)
         self.user_multi = encode_multi_matrix(df, fa.user_multi_cols, fa.user_multi_vocabs, multi_max_tokens)
@@ -35,4 +36,5 @@ class TwoTowerDataset(Dataset):
             self.client_num[idx],
             self.client_multi[idx],
             self.y[idx],
+            self.row_idx[idx],
         )

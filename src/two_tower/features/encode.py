@@ -19,6 +19,7 @@ class TwoTowerBatch:
     client_num: torch.Tensor
     client_multi: torch.Tensor
     label: torch.Tensor
+    row_idx: torch.Tensor
 
 
 def encode_cats(df: pd.DataFrame, cat_cols: list[str], vocabs: dict) -> torch.Tensor:
@@ -64,7 +65,7 @@ def encode_nums(df: pd.DataFrame, num_cols: list[str]) -> torch.Tensor:
 
 
 def collate_fn(batch) -> TwoTowerBatch:
-    uc, un, um, cc, cn, cm, y = zip(*batch)
+    uc, un, um, cc, cn, cm, y, ridx = zip(*batch)
     return TwoTowerBatch(
         user_cat=torch.stack(uc),
         user_num=torch.stack(un),
@@ -73,4 +74,5 @@ def collate_fn(batch) -> TwoTowerBatch:
         client_num=torch.stack(cn),
         client_multi=torch.stack(cm),
         label=torch.stack(y),
+        row_idx=torch.stack(ridx),
     )
