@@ -146,7 +146,9 @@ def merge_client_metadata_into_frames(
     if key not in cmf.columns:
         raise KeyError(f"client_metadata missing join column {key!r}; have: {list(cmf.columns)[:40]}")
 
-    need = list(cfg.features.client_feature_cols)
+    # Guard against a common config mistake: including the join key in the feature list.
+    # If `need` contains `key`, Pandas can end up with duplicate column labels (e.g. "client_bundle_id").
+    need = [c for c in cfg.features.client_feature_cols if c != key]
     missing_meta = [c for c in need if c not in cmf.columns]
     if missing_meta:
         raise KeyError(
@@ -159,6 +161,13 @@ def merge_client_metadata_into_frames(
     def _apply(df: pd.DataFrame, name: str) -> pd.DataFrame:
         out = df.drop(columns=[c for c in need if c in df.columns], errors="ignore")
         merged = out.merge(meta, on=key, how="left", validate="many_to_one")
+        if not merged.columns.is_unique:
+            dupes = merged.columns[merged.columns.duplicated()].tolist()
+            raise ValueError(
+                f"{name}: duplicate column labels after client metadata merge: {dupes}. "
+                f"Most often this happens when the join key {key!r} is included in "
+                f"`features.client_feature_cols`."
+            )
         bad = merged[need].isna().any(axis=1)
         if bad.any():
             missing_ids = merged.loc[bad, key].drop_duplicates().tolist()

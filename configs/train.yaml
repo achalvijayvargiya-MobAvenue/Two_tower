@@ -121,7 +121,6 @@ features:
     - "organic_genres_top_4"
     - "organic_genres_top_5"
   client_feature_cols:
-    - "client_bundle_id"
     - "client_genreid"
     - "client_content_rating"
   user_multi_cols: []
