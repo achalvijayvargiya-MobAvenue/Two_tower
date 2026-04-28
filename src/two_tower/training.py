@@ -561,14 +561,18 @@ def train_and_log(
 
                 if np.isfinite(val_auc) and val_auc > best_val_auc:
                     best_val_auc = val_auc
-                best_epoch = epoch
-                best_snapshot = {
-                    "user_tower": {k: v.detach().cpu().clone() for k, v in m.user_tower.state_dict().items()},
-                    "client_tower": {k: v.detach().cpu().clone() for k, v in m.client_tower.state_dict().items()},
-                    "log_scale": m.log_scale.detach().cpu().clone(),
-                }
-                if _is_rank0():
-                    print(f"  -> new best val_auc={best_val_auc:.4f} (epoch {epoch + 1})")
+                    best_epoch = epoch
+                    best_snapshot = {
+                        "user_tower": {
+                            k: v.detach().cpu().clone() for k, v in m.user_tower.state_dict().items()
+                        },
+                        "client_tower": {
+                            k: v.detach().cpu().clone() for k, v in m.client_tower.state_dict().items()
+                        },
+                        "log_scale": m.log_scale.detach().cpu().clone(),
+                    }
+                    if _is_rank0():
+                        print(f"  -> new best val_auc={best_val_auc:.4f} (epoch {epoch + 1})")
 
             _scale_val = m.log_scale.clamp(math.log(1.0), math.log(100.0)).exp().item()
             metrics_to_log = {
