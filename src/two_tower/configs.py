@@ -45,6 +45,10 @@ class TrainConfig:
     num_workers: int
     device: str  # "cuda" or "cpu"
 
+    # If set, run a fixed number of optimizer steps per epoch (option B training).
+    # When unset, an epoch iterates over the DataLoader once.
+    steps_per_epoch: int | None = None
+
     # Performance / distributed (all optional; defaults preserve current behavior)
     # If torch.distributed env vars are set (WORLD_SIZE>1), training will use DDP automatically.
     dataloader_pin_memory: bool = True
@@ -64,6 +68,12 @@ class TrainConfig:
     # After ratio balancing, cap every client to the same row count (min across clients).
     downsample_equalize_client_rows: bool = True
     downsample_random_state: int = 42
+
+    # Batch-level balancing (does NOT change dataset size; affects only sampling into batches).
+    # When enabled, batches are constructed to match global per-client frequency and enforce a
+    # per-client negative-to-positive ratio (e.g. 3 means 3 negatives per positive).
+    batch_balance: bool = False
+    batch_balance_neg_per_pos: int = 3
 
     # Hash embedding init for categorical columns (reference: PRETRAINED_EMB_DIM)
     pretrained_emb_dim: int = 128

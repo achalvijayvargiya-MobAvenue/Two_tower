@@ -32,6 +32,7 @@ from torch.utils.data import DataLoader
 from two_tower.config_loader import load_pipeline_config
 from two_tower.configs import PipelineConfig
 from two_tower.data.dataset import TwoTowerDataset
+from two_tower.data.balanced_batch_sampler import BalancedClientLabelBatchSampler
 from two_tower.data.load import load_train_validation_frames
 from two_tower.features.encode import collate_fn
 from two_tower.features.prepare import FeatureArtifacts, prepare_training_features
@@ -286,6 +287,10 @@ def train_and_log(
             backend = "gloo"
         if dist.is_available() and not dist.is_initialized():
             dist.init_process_group(backend=backend)
+    # Ensure stable 0..N-1 indexing because the dataset resets index(drop=True).
+    train_df = train_df.reset_index(drop=True)
+    val_df = val_df.reset_index(drop=True)
+
     train_ds = TwoTowerDataset(train_df, fa, label_col=fc.label_col, multi_max_tokens=tc.multi_max_tokens)
     val_ds = TwoTowerDataset(val_df, fa, label_col=fc.label_col, multi_max_tokens=tc.multi_max_tokens)
 
@@ -311,17 +316,45 @@ def train_and_log(
         train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True, seed=tc.seed)
         val_sampler = DistributedSampler(val_ds, num_replicas=world_size, rank=rank, shuffle=False, seed=tc.seed)
 
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=per_rank_bs,
-        shuffle=(train_sampler is None),
-        sampler=train_sampler,
-        num_workers=tc.num_workers,
-        collate_fn=collate_fn,
-        pin_memory=pin_memory,
-        persistent_workers=persistent_workers,
-        prefetch_factor=prefetch_factor if tc.num_workers > 0 else None,
-    )
+    batch_sampler = None
+    if bool(getattr(tc, "batch_balance", False)):
+        if is_dist:
+            # Implementing globally-correct per-batch ratios under DDP requires a coordinated sampler.
+            # For now, fall back to DistributedSampler.
+            if _is_rank0():
+                print("[train] batch_balance requested but DDP is enabled; falling back to standard sampling.")
+        else:
+            batch_sampler = BalancedClientLabelBatchSampler(
+                train_df,
+                client_id_col=fc.client_id_col,
+                label_col=fc.label_col,
+                batch_size=per_rank_bs,
+                neg_per_pos=int(getattr(tc, "batch_balance_neg_per_pos", 3)),
+                seed=int(tc.seed),
+            )
+
+    if batch_sampler is not None:
+        train_loader = DataLoader(
+            train_ds,
+            batch_sampler=batch_sampler,
+            num_workers=tc.num_workers,
+            collate_fn=collate_fn,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
+            prefetch_factor=prefetch_factor if tc.num_workers > 0 else None,
+        )
+    else:
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=per_rank_bs,
+            shuffle=(train_sampler is None),
+            sampler=train_sampler,
+            num_workers=tc.num_workers,
+            collate_fn=collate_fn,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
+            prefetch_factor=prefetch_factor if tc.num_workers > 0 else None,
+        )
     val_loader = DataLoader(
         val_ds,
         batch_size=per_rank_bs,
@@ -435,7 +468,26 @@ def train_and_log(
                 if is_dist and train_sampler is not None:
                     train_sampler.set_epoch(epoch)
 
-                for batch in train_loader:
+                steps_per_epoch = getattr(tc, "steps_per_epoch", None)
+                if steps_per_epoch is None:
+                    batch_iter = iter(train_loader)
+                    steps_per_epoch = None
+                else:
+                    steps_per_epoch = int(steps_per_epoch)
+                    if steps_per_epoch <= 0:
+                        raise ValueError("train.steps_per_epoch must be > 0 when set")
+                    batch_iter = iter(train_loader)
+
+                step = 0
+                while True:
+                    if steps_per_epoch is not None and step >= steps_per_epoch:
+                        break
+                    try:
+                        batch = next(batch_iter)
+                    except StopIteration:
+                        batch_iter = iter(train_loader)
+                        batch = next(batch_iter)
+
                     nb = bool(pin_memory)
                     user_cat = batch.user_cat.to(device, non_blocking=nb)
                     user_num = batch.user_num.to(device, non_blocking=nb)
@@ -470,6 +522,7 @@ def train_and_log(
                                 f"avg_loss={total_loss / max(total_count, 1):.6f}"
                             )
                         last_hb = now
+                    step += 1
 
                 avg_train_loss = total_loss / max(total_count, 1)
                 train_metrics: dict[str, float] | None = None
