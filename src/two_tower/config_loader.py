@@ -118,6 +118,12 @@ def load_pipeline_config(path: str | Path) -> PipelineConfig:
         multi_max_tokens=int(t.get("multi_max_tokens", 32)),
         num_workers=int(t.get("num_workers", 4)),
         device=str(t.get("device", "cuda")),
+        train_eval_max_examples=int(t["train_eval_max_examples"])
+        if t.get("train_eval_max_examples") not in (None, "", 0)
+        else None,
+        train_client_eval_max_examples=int(t["train_client_eval_max_examples"])
+        if t.get("train_client_eval_max_examples") not in (None, "", 0)
+        else None,
         dataloader_pin_memory=bool(t.get("dataloader_pin_memory", True)),
         dataloader_persistent_workers=bool(t.get("dataloader_persistent_workers", True)),
         dataloader_prefetch_factor=int(t.get("dataloader_prefetch_factor", 2)),

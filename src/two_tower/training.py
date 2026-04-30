@@ -231,6 +231,7 @@ def _client_group_metrics(
         if not bool(np.any(m)):
             continue
         met = _binary_metrics(yt[m], ys[m], threshold=0.5)
+        met["_n"] = float(int(np.sum(m)))
         per_client[cid] = met
         a = float(met.get("auc_roc", float("nan")))
         if np.isfinite(a):
@@ -463,6 +464,7 @@ def train_and_log(
                 train_eval_max = max(train_eval_max, 0)
                 train_scores: list[np.ndarray] = []
                 train_labels: list[np.ndarray] = []
+                train_row_idx: list[np.ndarray] = []
                 train_eval_kept = 0
 
                 if is_dist and train_sampler is not None:
@@ -513,6 +515,7 @@ def train_and_log(
                         if keep > 0:
                             train_scores.append(logits.detach().cpu().numpy().ravel()[:keep])
                             train_labels.append(labels.detach().cpu().numpy().ravel()[:keep])
+                            train_row_idx.append(batch.row_idx.detach().cpu().numpy().ravel()[:keep])
                             train_eval_kept += keep
                     now = time.time()
                     if now - last_hb >= hb_every_s:
@@ -526,10 +529,29 @@ def train_and_log(
 
                 avg_train_loss = total_loss / max(total_count, 1)
                 train_metrics: dict[str, float] | None = None
+                train_client_metrics: dict[object, dict[str, float]] = {}
+                train_client_summary: dict[str, float] = {"macro_auc": float("nan"), "worst_client_auc": float("nan")}
                 if train_eval_max > 0 and train_eval_kept > 0 and _is_rank0():
                     ytr = np.concatenate(train_labels, axis=0)
                     yts = np.concatenate(train_scores, axis=0)
                     train_metrics = _binary_metrics(ytr, yts, threshold=0.5)
+                    # Optional per-client train metrics on the same sample (maps back via row_idx).
+                    ridx = np.concatenate(train_row_idx, axis=0)
+                    max_c = getattr(tc, "train_client_eval_max_examples", None)
+                    if max_c is None:
+                        max_c = train_eval_max
+                    max_c = int(max_c or 0)
+                    if max_c > 0 and ridx.size > max_c:
+                        ridx = ridx[:max_c]
+                        ytr = ytr[:max_c]
+                        yts = yts[:max_c]
+                    train_client_metrics, train_client_summary = _client_group_metrics(
+                        val_df=train_df,
+                        client_id_col=fc.client_id_col,
+                        row_idx=ridx,
+                        y_true=ytr,
+                        y_score=yts,
+                    )
 
                 model.eval()
                 val_loss = 0.0
@@ -652,10 +674,17 @@ def train_and_log(
                 "val_auc_worst_client": float(client_summary["worst_client_auc"]),
             }
             if _is_rank0() and per_client_metrics:
-                # Log per-client AUCs for debugging/fairness tracking.
+                # Log per-client metrics for debugging/fairness tracking.
                 for cid, met in per_client_metrics.items():
                     k = _safe_mlflow_key(cid)
-                    metrics_to_log[f"val_auc_client__{k}"] = float(met.get("auc_roc", float("nan")))
+                    metrics_to_log[f"val_client__{k}__auc"] = float(met.get("auc_roc", float("nan")))
+                    metrics_to_log[f"val_client__{k}__auc_pr"] = float(met.get("auc_pr", float("nan")))
+                    metrics_to_log[f"val_client__{k}__precision"] = float(met.get("precision", float("nan")))
+                    metrics_to_log[f"val_client__{k}__recall"] = float(met.get("recall", float("nan")))
+                    metrics_to_log[f"val_client__{k}__f1"] = float(met.get("f1", float("nan")))
+                    metrics_to_log[f"val_client__{k}__logloss"] = float(met.get("logloss", float("nan")))
+                    metrics_to_log[f"val_client__{k}__pos_rate"] = float(met.get("label_pos_rate", float("nan")))
+                    metrics_to_log[f"val_client__{k}__n"] = float(met.get("_n", float("nan")))
             if train_metrics is not None:
                 metrics_to_log.update(
                     {
@@ -667,8 +696,21 @@ def train_and_log(
                         "train_accuracy": float(train_metrics["accuracy"]),
                         "train_logloss": float(train_metrics["logloss"]),
                         "train_label_pos_rate": float(train_metrics["label_pos_rate"]),
+                        "train_auc_macro_client": float(train_client_summary["macro_auc"]),
+                        "train_auc_worst_client": float(train_client_summary["worst_client_auc"]),
                     }
                 )
+                if _is_rank0() and train_client_metrics:
+                    for cid, met in train_client_metrics.items():
+                        k = _safe_mlflow_key(cid)
+                        metrics_to_log[f"train_client__{k}__auc"] = float(met.get("auc_roc", float("nan")))
+                        metrics_to_log[f"train_client__{k}__auc_pr"] = float(met.get("auc_pr", float("nan")))
+                        metrics_to_log[f"train_client__{k}__precision"] = float(met.get("precision", float("nan")))
+                        metrics_to_log[f"train_client__{k}__recall"] = float(met.get("recall", float("nan")))
+                        metrics_to_log[f"train_client__{k}__f1"] = float(met.get("f1", float("nan")))
+                        metrics_to_log[f"train_client__{k}__logloss"] = float(met.get("logloss", float("nan")))
+                        metrics_to_log[f"train_client__{k}__pos_rate"] = float(met.get("label_pos_rate", float("nan")))
+                        metrics_to_log[f"train_client__{k}__n"] = float(met.get("_n", float("nan")))
             if _is_rank0():
                 mlflow.log_metrics(metrics_to_log, step=epoch)
 
@@ -687,7 +729,10 @@ def train_and_log(
                     print(
                         f"           train_auc={train_metrics['auc_roc']:.4f} train_pr_auc={train_metrics['auc_pr']:.4f} "
                         f"train_prec={train_metrics['precision']:.4f} train_rec={train_metrics['recall']:.4f} "
-                        f"train_f1={train_metrics['f1']:.4f} (sample_n={train_eval_kept})"
+                        f"train_f1={train_metrics['f1']:.4f} "
+                        f"train_auc_macro={train_client_summary['macro_auc']:.4f} "
+                        f"train_auc_worst={train_client_summary['worst_client_auc']:.4f} "
+                        f"(sample_n={train_eval_kept})"
                     )
                 runlog.write(
                     "EPOCH_DONE "
@@ -701,6 +746,26 @@ def train_and_log(
                     f"val_cm_tn={int(val_metrics['tn'])} val_cm_fp={int(val_metrics['fp'])} "
                     f"val_cm_fn={int(val_metrics['fn'])} val_cm_tp={int(val_metrics['tp'])}"
                 )
+                if per_client_metrics:
+                    parts = []
+                    for cid, met in per_client_metrics.items():
+                        parts.append(
+                            f"{_safe_mlflow_key(cid)}:"
+                            f"n={int(float(met.get('_n', float('nan')))) if np.isfinite(float(met.get('_n', float('nan')))) else -1}"
+                            f" pos={float(met.get('label_pos_rate', float('nan'))):.4f}"
+                            f" auc={float(met.get('auc_roc', float('nan'))):.4f}"
+                        )
+                    runlog.write("VAL_CLIENT_AUC " + " ".join(parts))
+                if train_client_metrics:
+                    parts = []
+                    for cid, met in train_client_metrics.items():
+                        parts.append(
+                            f"{_safe_mlflow_key(cid)}:"
+                            f"n={int(float(met.get('_n', float('nan')))) if np.isfinite(float(met.get('_n', float('nan')))) else -1}"
+                            f" pos={float(met.get('label_pos_rate', float('nan'))):.4f}"
+                            f" auc={float(met.get('auc_roc', float('nan'))):.4f}"
+                        )
+                    runlog.write("TRAIN_CLIENT_AUC " + " ".join(parts))
 
         if _is_rank0():
             if best_snapshot is not None:

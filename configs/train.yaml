@@ -178,6 +178,10 @@ train:
   # Batch-level balancing: preserve global client mix + enforce per-client neg:pos ratio.
   batch_balance: true
   batch_balance_neg_per_pos: 3
+  # Compute train metrics every epoch on a bounded sample (keeps it cheap).
+  # Set higher for more stable per-client numbers; set null/0 to disable.
+  train_eval_max_examples: 200000
+  train_client_eval_max_examples: 200000
   lr: 0.001
   weight_decay: 0.0
   embed_dim: 1024

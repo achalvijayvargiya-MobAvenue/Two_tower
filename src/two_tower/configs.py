@@ -49,6 +49,12 @@ class TrainConfig:
     # When unset, an epoch iterates over the DataLoader once.
     steps_per_epoch: int | None = None
 
+    # Optional: compute train metrics each epoch on a bounded sample of seen examples.
+    # Set to 0/None to disable.
+    train_eval_max_examples: int | None = None
+    # Optional: per-client train metrics sample size (defaults to train_eval_max_examples if unset).
+    train_client_eval_max_examples: int | None = None
+
     # Performance / distributed (all optional; defaults preserve current behavior)
     # If torch.distributed env vars are set (WORLD_SIZE>1), training will use DDP automatically.
     dataloader_pin_memory: bool = True
