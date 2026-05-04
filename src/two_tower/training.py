@@ -552,6 +552,11 @@ def train_and_log(
                         y_true=ytr,
                         y_score=yts,
                     )
+                    runlog.write(
+                        f"TRAIN_CLIENT_METRICS_DEBUG epoch={epoch + 1}/{tc.epochs} "
+                        f"client_id_col={fc.client_id_col!r} present={(fc.client_id_col in train_df.columns)} "
+                        f"n_clients={len(train_client_metrics)} sample_n={int(ytr.size)}"
+                    )
 
                 model.eval()
                 val_loss = 0.0
@@ -608,12 +613,18 @@ def train_and_log(
                     row_idx = ridx_t.numpy()
                     val_metrics = _binary_metrics(y_true, y_score, threshold=0.5)
                     val_auc = float(val_metrics["auc_roc"])
+                    client_col_ok = (fc.client_id_col in val_df.columns)
                     per_client_metrics, client_summary = _client_group_metrics(
                         val_df=val_df,
                         client_id_col=fc.client_id_col,
                         row_idx=row_idx,
                         y_true=y_true,
                         y_score=y_score,
+                    )
+                    runlog.write(
+                        f"VAL_CLIENT_METRICS_DEBUG epoch={epoch + 1}/{tc.epochs} "
+                        f"client_id_col={fc.client_id_col!r} present={client_col_ok} "
+                        f"n_clients={len(per_client_metrics)}"
                     )
                 else:
                     val_metrics = {
@@ -725,6 +736,11 @@ def train_and_log(
                     f"val_f1={val_metrics['f1']:.4f} | scale={_scale_val:.2f} | "
                     f"val_nonfinite uemb={val_uemb_bad} cemb={val_cemb_bad} logits={val_logits_nonfinite}"
                 )
+                if per_client_metrics:
+                    parts = []
+                    for cid, met in per_client_metrics.items():
+                        parts.append(f"{_safe_mlflow_key(cid)}={float(met.get('auc_roc', float('nan'))):.4f}")
+                    print("           val_client_auc:", ", ".join(parts))
                 if train_metrics is not None:
                     print(
                         f"           train_auc={train_metrics['auc_roc']:.4f} train_pr_auc={train_metrics['auc_pr']:.4f} "
@@ -734,6 +750,11 @@ def train_and_log(
                         f"train_auc_worst={train_client_summary['worst_client_auc']:.4f} "
                         f"(sample_n={train_eval_kept})"
                     )
+                    if train_client_metrics:
+                        parts = []
+                        for cid, met in train_client_metrics.items():
+                            parts.append(f"{_safe_mlflow_key(cid)}={float(met.get('auc_roc', float('nan'))):.4f}")
+                        print("           train_client_auc:", ", ".join(parts))
                 runlog.write(
                     "EPOCH_DONE "
                     f"epoch={epoch + 1}/{tc.epochs} "
