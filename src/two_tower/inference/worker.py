@@ -18,7 +18,7 @@ from torch import nn
 from two_tower.features.encode import encode_cats, encode_multi_matrix, encode_nums
 from two_tower.features.vocab import vocab_from_dict
 from two_tower.io.uris import read_uri_bytes
-from two_tower.model.two_tower import DCNv2UserTower
+from two_tower.model.two_tower import DCNv2UserTower, UserMLPTower
 
 
 def _iter_record_batches(dset: Any, cols: list[str], batch_size: int):
@@ -70,6 +70,8 @@ def _rank_batch_topk(
     use_amp: bool,
     amp_dtype_torch: torch.dtype,
     to_device: torch.device,
+    worker_id: int,
+    forward_probe_state: dict[str, int] | None = None,
 ) -> pd.DataFrame:
     device_ids = infer_df[device_id_col].to_numpy()
     uc = encode_cats(infer_df, user_cat_cols, user_vocabs)
@@ -102,6 +104,21 @@ def _rank_batch_topk(
     )
 
     with torch.inference_mode(), ctx:
+        # Baseline latency probe: log single-row user-tower forward for first few records only.
+        if forward_probe_state is not None and int(forward_probe_state.get("remaining", 0)) > 0 and bsz > 0:
+            probe_n = min(int(forward_probe_state.get("remaining", 0)), bsz)
+            for i in range(probe_n):
+                t0 = time.perf_counter()
+                _ = user_tower(uc[i : i + 1], un[i : i + 1], um[i : i + 1])
+                if to_device.type == "cuda":
+                    torch.cuda.synchronize()
+                elapsed_ms = (time.perf_counter() - t0) * 1000.0
+                print(
+                    f"[infer][worker={worker_id}] single_forward_ms={elapsed_ms:.3f} device_id={device_ids[i]}",
+                    flush=True,
+                )
+            forward_probe_state["remaining"] = int(forward_probe_state.get("remaining", 0)) - probe_n
+
         uemb = user_tower(uc, un, um)
 
         best_scores = torch.full((bsz, topk), -1.0, device=to_device, dtype=torch.float32)
@@ -110,7 +127,7 @@ def _rank_batch_topk(
         for start in range(0, n_clients, client_chunk):
             end = min(start + client_chunk, n_clients)
             chunk = client_emb_t[start:end]
-            scores = torch.sigmoid((uemb @ chunk.T).float())
+            scores = (uemb @ chunk.T).float()
             k = min(topk, end - start)
             cs, ci = torch.topk(scores, k=k, dim=1)
             ci = ci + start
@@ -194,15 +211,16 @@ def tt_infer_worker(
     umd = state.get("user_multi_emb_dims") or []
     mp = state.get("multi_cat_pool", "mean")
     use_pt_cat = bool(state.get("use_pretrained_cat", False))
-    num_cross_layers = int(state.get("num_cross_layers", 3))
-    deep_hidden = state.get("user_deep_hidden") or [512, 512]
+    arch = str(state.get("user_tower_arch", "dcnv2")).lower()
+    hidden = state.get("user_hidden")
+    if hidden is None:
+        hidden = state.get("user_deep_hidden")
+    hidden = list(hidden or [512, 512])
 
-    user_tower = DCNv2UserTower(
+    common_kwargs = dict(
         user_vocab_sizes=expected_vocab_sizes,
         user_num_dim=expected_num_dim,
         emb_dim=emb_dim,
-        num_cross_layers=num_cross_layers,
-        deep_hidden=list(deep_hidden),
         user_multi_vocab_sizes=um if um else None,
         user_multi_emb_dims=umd if umd else None,
         multi_pool=mp,
@@ -210,7 +228,15 @@ def tt_infer_worker(
         pretrained_emb_dim=int(state.get("pretrained_emb_dim", 128)),
         target_cat_emb_dim=int(state.get("target_cat_emb_dim", 64)),
         freeze_base=bool(state.get("freeze_base", True)),
-    ).to(to_device)
+    )
+    if arch == "mlp":
+        user_tower = UserMLPTower(hidden=hidden, **common_kwargs).to(to_device)
+    else:
+        user_tower = DCNv2UserTower(
+            num_cross_layers=int(state.get("num_cross_layers", 3)),
+            deep_hidden=hidden,
+            **common_kwargs,
+        ).to(to_device)
     user_tower.load_state_dict(state["state_dict"])
     user_tower.eval()
     if hasattr(torch, "compile") and to_device.type == "cuda":
@@ -244,6 +270,8 @@ def tt_infer_worker(
     out_buf: list[pd.DataFrame] = []
     out_rows = 0
     out_prefix = infer_ranking_output
+    # Log only the first few single-row forward passes to estimate baseline inference latency.
+    forward_probe_state: dict[str, int] = {"remaining": 5}
 
     def _flush(force: bool = False) -> None:
         nonlocal part, out_buf, out_rows
@@ -337,6 +365,8 @@ def tt_infer_worker(
                         use_amp=use_amp,
                         amp_dtype_torch=amp_dtype_torch,
                         to_device=to_device,
+                        worker_id=worker_id,
+                        forward_probe_state=forward_probe_state,
                     )
                     t_inf += time.time() - t0
                     out_buf.append(out_df)
@@ -393,6 +423,8 @@ def tt_infer_worker(
                         use_amp=use_amp,
                         amp_dtype_torch=amp_dtype_torch,
                         to_device=to_device,
+                        worker_id=worker_id,
+                        forward_probe_state=forward_probe_state,
                     )
                     t_inf += time.time() - t0
                     out_buf.append(out_df)

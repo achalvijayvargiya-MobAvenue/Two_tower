@@ -95,9 +95,12 @@ def load_pipeline_config(path: str | Path) -> PipelineConfig:
     )
 
     t = raw.get("train") or {}
-    mlp = t.get("mlp_hidden_dims")
-    if mlp is None:
-        raise KeyError(f"train.mlp_hidden_dims is required in {path}")
+    user_hidden = t.get("user_mlp_hidden")
+    if user_hidden is None:
+        # Backward-compatible fallback for older configs.
+        user_hidden = t.get("mlp_hidden_dims")
+    if user_hidden is None:
+        raise KeyError(f"train.user_mlp_hidden is required in {path}")
     cmh = t.get("client_mlp_hidden")
     if cmh is None:
         cmh = [256, 256]
@@ -111,8 +114,7 @@ def load_pipeline_config(path: str | Path) -> PipelineConfig:
         lr=float(t.get("lr", 1e-3)),
         weight_decay=float(t.get("weight_decay", 0.0)),
         embed_dim=int(t.get("embed_dim", 1024)),
-        dcn_cross_layers=int(t.get("dcn_cross_layers", 3)),
-        mlp_hidden_dims=list(mlp),
+        user_mlp_hidden=list(user_hidden),
         min_count=int(t.get("min_count", 5)),
         num_oov_buckets=int(t.get("num_oov_buckets", 1000)),
         multi_max_tokens=int(t.get("multi_max_tokens", 32)),

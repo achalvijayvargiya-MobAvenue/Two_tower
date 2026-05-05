@@ -35,8 +35,7 @@ class TrainConfig:
     weight_decay: float
 
     embed_dim: int  # final embedding dim (e.g. 1024)
-    dcn_cross_layers: int
-    mlp_hidden_dims: list[int]
+    user_mlp_hidden: list[int]
 
     min_count: int
     num_oov_buckets: int
@@ -89,7 +88,7 @@ class TrainConfig:
     # Multi-value categorical pooling in towers (reference: MULTI_CAT_POOL)
     multi_cat_pool: str = "mean"
 
-    # Client MLP hidden layers (reference: CLIENT_HIDDEN); user deep stack uses mlp_hidden_dims
+    # Client MLP hidden layers
     client_mlp_hidden: list[int] = field(default_factory=lambda: [256, 256])
 
 

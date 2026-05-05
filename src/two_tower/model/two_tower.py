@@ -195,6 +195,63 @@ class DCNv2UserTower(nn.Module):
         return _safe_l2_normalize(emb, dim=1)
 
 
+class UserMLPTower(nn.Module):
+    def __init__(
+        self,
+        user_vocab_sizes: List[int],
+        user_num_dim: int,
+        emb_dim: int = 1024,
+        hidden: List[int] | None = None,
+        user_multi_vocab_sizes: List[int] | None = None,
+        user_multi_emb_dims: List[int] | None = None,
+        multi_pool: str = "mean",
+        use_pretrained_cat: bool = False,
+        user_cat_pretrained_weights: list | None = None,
+        pretrained_emb_dim: int = 384,
+        target_cat_emb_dim: int = 64,
+        freeze_base: bool = False,
+    ):
+        super().__init__()
+        if hidden is None:
+            hidden = [512, 256]
+
+        self.user_cat = CatEmbedder(
+            user_vocab_sizes,
+            use_pretrained=use_pretrained_cat,
+            pretrained_weights=user_cat_pretrained_weights,
+            pretrained_emb_dim=pretrained_emb_dim,
+            target_emb_dim_per_col=target_cat_emb_dim,
+            freeze_base=freeze_base,
+        )
+        ms = list(user_multi_vocab_sizes or [])
+        if ms:
+            ed = user_multi_emb_dims or [embedding_dim_for_cardinality(v) for v in ms]
+            self.user_multi = PooledMultiCatEmbedder(ms, ed, pool=multi_pool)
+        else:
+            self.user_multi = None
+
+        cat_w = self.user_cat.output_dim() + (self.user_multi.output_dim() if self.user_multi else 0)
+        input_dim = int(cat_w + user_num_dim)
+
+        layers: list[nn.Module] = []
+        prev = input_dim
+        for h in hidden:
+            layers.append(nn.Linear(prev, h))
+            layers.append(nn.ReLU())
+            layers.append(nn.LayerNorm(h))
+            prev = h
+        layers.append(nn.Linear(prev, emb_dim))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, user_cat: torch.Tensor, user_num: torch.Tensor, user_multi: torch.Tensor) -> torch.Tensor:
+        cat = self.user_cat(user_cat)
+        if self.user_multi is not None:
+            cat = torch.cat([cat, self.user_multi(user_multi)], dim=1)
+        x = torch.cat([cat, user_num], dim=1)
+        emb = self.net(x)
+        return _safe_l2_normalize(emb, dim=1)
+
+
 class ClientMLPTower(nn.Module):
     def __init__(
         self,
@@ -271,18 +328,16 @@ class TwoTowerModel(nn.Module):
         pretrained_emb_dim: int = 384,
         target_cat_emb_dim: int = 64,
         freeze_pretrained_base: bool = False,
-        num_cross_layers: int = 2,
-        user_deep_hidden: List[int] | None = None,
+        user_hidden: List[int] | None = None,
         client_hidden: List[int] | None = None,
     ):
         super().__init__()
         self.log_scale = nn.Parameter(torch.tensor(math.log(20.0)))
-        self.user_tower = DCNv2UserTower(
+        self.user_tower = UserMLPTower(
             user_vocab_sizes,
             user_num_dim,
             emb_dim=emb_dim,
-            num_cross_layers=num_cross_layers,
-            deep_hidden=user_deep_hidden,
+            hidden=user_hidden,
             user_multi_vocab_sizes=user_multi_vocab_sizes,
             user_multi_emb_dims=user_multi_emb_dims,
             multi_pool=multi_pool,
@@ -354,8 +409,7 @@ def build_two_tower_model(fa, cfg) -> TwoTowerModel:
         client_vocab_sizes=client_vocab_sizes,
         client_num_dim=client_num_dim,
         emb_dim=tc.embed_dim,
-        num_cross_layers=tc.dcn_cross_layers,
-        user_deep_hidden=list(tc.mlp_hidden_dims),
+        user_hidden=list(tc.user_mlp_hidden),
         client_hidden=list(tc.client_mlp_hidden),
         user_multi_vocab_sizes=user_multi_vocab_sizes or None,
         user_multi_emb_dims=user_multi_emb_dims or None,
