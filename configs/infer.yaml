@@ -1,5 +1,5 @@
 paths:
-  infer: "s3://mobavenue-simplismart-aws-s3-apse-sg/rtb/data/two_tower_ml/test_data_final/20260426_full/"
+  infer: "s3://mobavenue-simplismart-aws-s3-apse-sg/rtb/data/two_tower_ml/test_data_final/20260501_full/"
   artifacts_base: "s3://mobavenue-simplismart-aws-s3-apse-sg/rtb/data/two_tower_ml/3_Client/"
 
 features:
@@ -12,7 +12,7 @@ infer:
   infer_stream_batch_rows: 65536
   num_physical_gpus: 4
   workers_per_gpu: 3
-  ranking_output: "s3://mobavenue-simplismart-aws-s3-apse-sg/rtb/data/two_tower_ml/user_client_rankings_26/"
+  ranking_output: "s3://mobavenue-simplismart-aws-s3-apse-sg/rtb/data/two_tower_ml/user_client_rankings_0501/"
   rank_user_batch: 2048
   client_chunk: 2048
   use_amp: true
