@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import hashlib
 import io
 import os
 import time
@@ -9,14 +10,12 @@ from contextlib import nullcontext
 from typing import Any
 
 import numpy as np
-import pandas as pd
 import polars as pl
 import pyarrow.dataset as pads
 import torch
 from torch import nn
 
-from two_tower.features.encode import encode_cats, encode_multi_matrix, encode_nums
-from two_tower.features.vocab import vocab_from_dict
+from two_tower.features.vocab import parse_multi_cell, vocab_from_dict
 from two_tower.io.uris import read_uri_bytes
 from two_tower.model.two_tower import DCNv2UserTower, UserMLPTower
 
@@ -32,26 +31,82 @@ def _iter_record_batches(dset: Any, cols: list[str], batch_size: int):
 
 
 def _prepare_frame(
-    pdf: pd.DataFrame,
+    pdf: pl.DataFrame,
     user_cat_cols: list[str],
     user_num_cols: list[str],
     user_multi_cols: list[str],
-) -> pd.DataFrame:
+) -> pl.DataFrame:
+    add_cols: list[pl.Expr] = []
     for c in user_cat_cols:
-        if c not in pdf.columns:
-            pdf[c] = "__NA__"
+        if c not in pdf.schema:
+            add_cols.append(pl.lit("__NA__").alias(c))
     for c in user_num_cols:
-        if c not in pdf.columns:
-            pdf[c] = 0.0
+        if c not in pdf.schema:
+            add_cols.append(pl.lit(0.0).alias(c))
     for c in user_multi_cols:
-        if c not in pdf.columns:
-            pdf[c] = None
+        if c not in pdf.schema:
+            add_cols.append(pl.lit(None).alias(c))
+    if add_cols:
+        pdf = pdf.with_columns(add_cols)
     return pdf
+
+
+def _encode_cats_pl(df: pl.DataFrame, cat_cols: list[str], vocabs: dict) -> torch.Tensor:
+    if not cat_cols:
+        return torch.zeros((len(df), 0), dtype=torch.long)
+    n = len(df)
+    out = np.empty((n, len(cat_cols)), dtype=np.int64)
+    for j, c in enumerate(cat_cols):
+        vocab = vocabs[c]
+        vals = df[c].to_list() if c in df.schema else ["__NA__"] * n
+        out[:, j] = np.fromiter((vocab.encode_scalar(v) for v in vals), dtype=np.int64, count=n)
+    return torch.from_numpy(out)
+
+
+def _encode_nums_pl(df: pl.DataFrame, num_cols: list[str]) -> torch.Tensor:
+    if not num_cols:
+        return torch.zeros((len(df), 0), dtype=torch.float32)
+    cols: list[np.ndarray] = []
+    n = len(df)
+    for c in num_cols:
+        if c in df.schema:
+            s = df[c].cast(pl.Float32, strict=False).fill_null(0.0)
+            arr = s.to_numpy()
+        else:
+            arr = np.zeros((n,), dtype=np.float32)
+        cols.append(np.asarray(arr, dtype=np.float32))
+    x = np.stack(cols, axis=1)
+    return torch.from_numpy(x)
+
+
+def _encode_multi_matrix_pl(
+    df: pl.DataFrame, cols: list[str], vocabs: dict, max_tokens: int
+) -> torch.Tensor:
+    """Shape (N, len(cols), max_tokens); 0 = pad / empty slot."""
+    n = len(df)
+    f = len(cols)
+    mt = int(max_tokens)
+    if f == 0:
+        return torch.zeros((n, 0, max(1, mt)), dtype=torch.long)
+    out = np.zeros((n, f, mt), dtype=np.int64)
+    for j, c in enumerate(cols):
+        vcb = vocabs[c]
+        vals = df[c].to_list() if c in df.schema else [None] * n
+        for i, val in enumerate(vals):
+            toks = parse_multi_cell(val)[:mt]
+            for k, tok in enumerate(toks):
+                tid = vcb.token_to_id.get(tok)
+                if tid is not None:
+                    out[i, j, k] = tid
+                else:
+                    h = int(hashlib.md5(tok.encode("utf-8")).hexdigest(), 16)
+                    out[i, j, k] = int(vcb.n_frequent + 1 + (h % vcb.num_oov_buckets))
+    return torch.from_numpy(out)
 
 
 def _rank_batch_topk(
     *,
-    infer_df: pd.DataFrame,
+    infer_df: pl.DataFrame,
     device_id_col: str,
     user_cat_cols: list[str],
     user_num_cols: list[str],
@@ -72,11 +127,11 @@ def _rank_batch_topk(
     to_device: torch.device,
     worker_id: int,
     forward_probe_state: dict[str, int] | None = None,
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     device_ids = infer_df[device_id_col].to_numpy()
-    uc = encode_cats(infer_df, user_cat_cols, user_vocabs)
-    un = encode_nums(infer_df, user_num_cols)
-    um = encode_multi_matrix(infer_df, user_multi_cols, user_multi_vocabs, multi_max_tokens)
+    uc = _encode_cats_pl(infer_df, user_cat_cols, user_vocabs)
+    un = _encode_nums_pl(infer_df, user_num_cols)
+    um = _encode_multi_matrix_pl(infer_df, user_multi_cols, user_multi_vocabs, multi_max_tokens)
 
     if uc.shape[1] < expected_cat_dim:
         uc = torch.cat([uc, torch.zeros((uc.shape[0], expected_cat_dim - uc.shape[1]), dtype=uc.dtype)], dim=1)
@@ -139,10 +194,8 @@ def _rank_batch_topk(
 
     s_np = best_scores.detach().cpu().numpy().astype(np.float32)
     i_np = best_idx.detach().cpu().numpy().astype(np.int64)
-    if to_device.type == "cuda":
-        torch.cuda.empty_cache()
 
-    return pd.DataFrame(
+    return pl.DataFrame(
         {
             device_id_col: np.repeat(device_ids, topk),
             "client_id": client_ids_np[i_np.reshape(-1)],
@@ -267,7 +320,7 @@ def tt_infer_worker(
     )
 
     part = 0
-    out_buf: list[pd.DataFrame] = []
+    out_buf: list[pl.DataFrame] = []
     out_rows = 0
     out_prefix = infer_ranking_output
     # Log only the first few single-row forward passes to estimate baseline inference latency.
@@ -277,7 +330,7 @@ def tt_infer_worker(
         nonlocal part, out_buf, out_rows
         if not out_buf or (not force and out_rows < output_min_rows):
             return
-        merged = pl.concat([pl.from_pandas(d) for d in out_buf])
+        merged = pl.concat(out_buf)
         path = f"{out_prefix}worker{worker_id:02d}_part_{part:06d}.parquet"
 
         merged.write_parquet(path, compression=output_compression)
@@ -329,7 +382,7 @@ def tt_infer_worker(
                         break
                     t0 = time.time()
                     chunk = _prepare_frame(
-                        pending[:rank_user_batch].to_pandas(),
+                        pending[:rank_user_batch],
                         user_cat_cols,
                         user_num_cols,
                         user_multi_cols,
@@ -342,7 +395,7 @@ def tt_infer_worker(
                         if remaining <= 0:
                             break
                         if len(chunk) > remaining:
-                            chunk = chunk.iloc[:remaining].copy()
+                            chunk = chunk[:remaining]
 
                     t0 = time.time()
                     out_df = _rank_batch_topk(
@@ -386,7 +439,7 @@ def tt_infer_worker(
             ):
                 t0 = time.time()
                 chunk = _prepare_frame(
-                    pending.to_pandas(),
+                    pending,
                     user_cat_cols,
                     user_num_cols,
                     user_multi_cols,
@@ -397,9 +450,9 @@ def tt_infer_worker(
                 if max_users_per_file is not None:
                     remaining = int(max_users_per_file) - users_this_file
                     if remaining > 0 and len(chunk) > remaining:
-                        chunk = chunk.iloc[:remaining].copy()
+                        chunk = chunk[:remaining]
                     elif remaining <= 0:
-                        chunk = chunk.iloc[:0].copy()
+                        chunk = chunk[:0]
 
                 t0 = time.time()
                 if len(chunk) > 0:
