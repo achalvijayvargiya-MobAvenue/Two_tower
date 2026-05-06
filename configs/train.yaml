@@ -8,10 +8,6 @@ features:
   device_id_col: device_id
   client_id_col: client_bundle_id
   user_feature_cols:
-  - carrier
-  - os_version
-  - recency
-  - city_original
   - state_original
   - city_tier
   - geographic_region
@@ -68,11 +64,6 @@ features:
   - distinct_rating_everyone_apps
   - distinct_rating_teen_apps
   - distinct_rating_mature_apps
-  - distinct_rating_everyone10plus_apps
-  - distinct_rating_12plus_apps
-  - distinct_rating_16plus_apps
-  - distinct_rating_18plus_apps
-  - distinct_rating_adults18plus_apps
   - bids_day_rate
   - bids_night_rate
   - bids_weekday_rate
@@ -85,20 +76,8 @@ features:
   - bids_hour_15_17_rate
   - bids_hour_18_20_rate
   - bids_hour_21_23_rate
-  - total_events
-  - bids_event_count
   - total_distinct_apps
   - unique_bid_apps
-  - bids_apps_top_1
-  - bids_apps_top_2
-  - bids_apps_top_3
-  - bids_apps_top_4
-  - bids_apps_top_5
-  - bids_apps_top_6
-  - bids_apps_top_7
-  - bids_apps_top_8
-  - bids_apps_top_9
-  - bids_apps_top_10
   - bids_genres_top_1
   - bids_genres_top_2
   - bids_genres_top_3
@@ -186,7 +165,7 @@ train:
   device: cuda
   pretrained_emb_dim: 128
   pretrained_cat_emb_dim: 128
-  freeze_pretrained_base: true
+  freeze_pretrained_base: false
   multi_cat_pool: mean
   client_mlp_hidden:
   - 128
