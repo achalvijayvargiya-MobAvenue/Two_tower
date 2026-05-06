@@ -17,8 +17,8 @@ infer:
   client_chunk: 2048
   use_amp: true
   amp_dtype: "float16"
-  user_tower_backend: "pytorch"
-  user_tower_onnx_uri: null
+  user_tower_backend: "tensorrt_onnxruntime"
+  user_tower_onnx_uri: "s3://.../artifacts/user_tower/user_tower.onnx"
   trt_fp16_enable: true
   trt_engine_cache_enable: true
   trt_engine_cache_path: null
