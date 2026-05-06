@@ -309,7 +309,14 @@ def _build_user_tower_backend(
             provider_options=provider_options,
         )
         out_name = session.get_outputs()[0].name
-        return OnnxRuntimeTensorRTUserTowerBackend(session=session, output_name=out_name, device=to_device), None
+        input_names = tuple(i.name for i in session.get_inputs())
+        print(f"  [backend:tensorrt_onnxruntime] onnx inputs={input_names} output={out_name}", flush=True)
+        return OnnxRuntimeTensorRTUserTowerBackend(
+            session=session,
+            output_name=out_name,
+            device=to_device,
+            input_names=input_names,
+        ), None
 
     raise ValueError(f"Unsupported infer.user_tower_backend={backend_name!r}")
 
