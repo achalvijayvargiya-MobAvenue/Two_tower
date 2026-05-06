@@ -98,6 +98,11 @@ def run_inference_job(cfg: InferJobConfig) -> None:
                 ic.infer_stream_batch_rows,
                 ic.workers_per_gpu,
                 ic.max_users_per_file,
+                ic.user_tower_backend,
+                ic.user_tower_onnx_uri,
+                ic.trt_fp16_enable,
+                ic.trt_engine_cache_enable,
+                ic.trt_engine_cache_path,
             ),
         )
         p.start()

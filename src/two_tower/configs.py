@@ -112,6 +112,17 @@ class InferenceConfig:
     output_min_rows_per_part: int = 100_000
     output_parquet_compression: str = "zstd"
     debug_cuda: bool = False
+    # User tower runtime backend:
+    # - "pytorch": existing nn.Module execution (default)
+    # - "tensorrt_onnxruntime": ONNX Runtime with TensorRT EP (falls back to CUDA/CPU EP)
+    user_tower_backend: str = "pytorch"
+    # Required when user_tower_backend="tensorrt_onnxruntime".
+    # Accepts local path or s3:// URI to an ONNX model that takes:
+    #   user_cat(int64), user_num(float32), user_multi(int64) -> user embedding(float32)
+    user_tower_onnx_uri: str | None = None
+    trt_fp16_enable: bool = True
+    trt_engine_cache_enable: bool = True
+    trt_engine_cache_path: str | None = None
 
     # Optional run-size controls for quick smoke tests.
     # - max_files: only process first N parquet inputs under paths.infer

@@ -17,6 +17,11 @@ infer:
   client_chunk: 2048
   use_amp: true
   amp_dtype: "float16"
+  user_tower_backend: "pytorch"
+  user_tower_onnx_uri: null
+  trt_fp16_enable: true
+  trt_engine_cache_enable: true
+  trt_engine_cache_path: null
   output_min_rows_per_part: 100000
   output_parquet_compression: "zstd"
   debug_cuda: false

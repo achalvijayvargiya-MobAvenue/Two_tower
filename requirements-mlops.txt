@@ -15,3 +15,5 @@ pyarrow>=15.0.0
 s3fs>=2024.1.0
 polars>=0.20.0
 PyYAML>=6.0.0
+# Optional Batch C runtime backend (TensorRT via ONNX Runtime EP stack):
+# onnxruntime-gpu>=1.18.0

@@ -4,9 +4,11 @@ import gc
 import hashlib
 import io
 import os
+import tempfile
 import time
 import traceback
 from contextlib import nullcontext
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -17,6 +19,11 @@ from torch import nn
 
 from two_tower.features.vocab import parse_multi_cell, vocab_from_dict
 from two_tower.io.uris import read_uri_bytes
+from two_tower.inference.user_tower_backend import (
+    OnnxRuntimeTensorRTUserTowerBackend,
+    TorchUserTowerBackend,
+    UserTowerBackend,
+)
 from two_tower.model.two_tower import DCNv2UserTower, UserMLPTower
 
 
@@ -117,7 +124,7 @@ def _rank_batch_topk(
     expected_vocab_sizes: list[int],
     expected_cat_dim: int,
     expected_num_dim: int,
-    user_tower: nn.Module,
+    user_tower_backend: UserTowerBackend,
     client_emb_t: torch.Tensor,
     client_ids_np: np.ndarray,
     topk: int,
@@ -152,9 +159,10 @@ def _rank_batch_topk(
     bsz = len(infer_df)
     n_clients = int(client_emb_t.shape[0])
 
+    use_torch_amp = user_tower_backend.backend_name == "pytorch"
     ctx = (
         torch.autocast(device_type="cuda", dtype=amp_dtype_torch)
-        if to_device.type == "cuda" and use_amp
+        if use_torch_amp and to_device.type == "cuda" and use_amp
         else nullcontext()
     )
 
@@ -164,7 +172,7 @@ def _rank_batch_topk(
             probe_n = min(int(forward_probe_state.get("remaining", 0)), bsz)
             for i in range(probe_n):
                 t0 = time.perf_counter()
-                _ = user_tower(uc[i : i + 1], un[i : i + 1], um[i : i + 1])
+                _ = user_tower_backend.infer(uc[i : i + 1], un[i : i + 1], um[i : i + 1])
                 if to_device.type == "cuda":
                     torch.cuda.synchronize()
                 elapsed_ms = (time.perf_counter() - t0) * 1000.0
@@ -174,7 +182,7 @@ def _rank_batch_topk(
                 )
             forward_probe_state["remaining"] = int(forward_probe_state.get("remaining", 0)) - probe_n
 
-        uemb = user_tower(uc, un, um)
+        uemb = user_tower_backend.infer(uc, un, um)
 
         best_scores = torch.full((bsz, topk), -1.0, device=to_device, dtype=torch.float32)
         best_idx = torch.full((bsz, topk), -1, device=to_device, dtype=torch.int64)
@@ -205,6 +213,107 @@ def _rank_batch_topk(
     )
 
 
+def _materialize_uri_to_local(uri: str, suffix: str) -> str:
+    """Download/load URI bytes to a local temp file path."""
+    if uri.startswith("s3://"):
+        raw = read_uri_bytes(uri)
+        fd, p = tempfile.mkstemp(suffix=suffix, prefix="two_tower_")
+        os.close(fd)
+        Path(p).write_bytes(raw)
+        return p
+    return str(Path(uri))
+
+
+def _build_user_tower_backend(
+    *,
+    backend_name: str,
+    onnx_uri: str | None,
+    to_device: torch.device,
+    use_amp: bool,
+    amp_dtype_torch: torch.dtype,
+    trt_fp16_enable: bool,
+    trt_engine_cache_enable: bool,
+    trt_engine_cache_path: str | None,
+    expected_vocab_sizes: list[int],
+    expected_num_dim: int,
+    emb_dim: int,
+    um: list[int],
+    umd: list[int],
+    mp: str,
+    use_pt_cat: bool,
+    hidden: list[int],
+    state: dict[str, Any],
+) -> tuple[UserTowerBackend, nn.Module | None]:
+    backend_name = str(backend_name or "pytorch").lower()
+    if backend_name == "pytorch":
+        common_kwargs = dict(
+            user_vocab_sizes=expected_vocab_sizes,
+            user_num_dim=expected_num_dim,
+            emb_dim=emb_dim,
+            user_multi_vocab_sizes=um if um else None,
+            user_multi_emb_dims=umd if umd else None,
+            multi_pool=mp,
+            use_pretrained_cat=use_pt_cat,
+            pretrained_emb_dim=int(state.get("pretrained_emb_dim", 128)),
+            target_cat_emb_dim=int(state.get("target_cat_emb_dim", 64)),
+            freeze_base=bool(state.get("freeze_base", True)),
+        )
+        arch = str(state.get("user_tower_arch", "dcnv2")).lower()
+        if arch == "mlp":
+            user_tower_model = UserMLPTower(hidden=hidden, **common_kwargs).to(to_device)
+        else:
+            user_tower_model = DCNv2UserTower(
+                num_cross_layers=int(state.get("num_cross_layers", 3)),
+                deep_hidden=hidden,
+                **common_kwargs,
+            ).to(to_device)
+        user_tower_model.load_state_dict(state["state_dict"])
+        user_tower_model.eval()
+        if hasattr(torch, "compile") and to_device.type == "cuda":
+            try:
+                user_tower_model = torch.compile(user_tower_model, mode="reduce-overhead")
+            except Exception:
+                pass
+        return TorchUserTowerBackend(model=user_tower_model), user_tower_model
+
+    if backend_name == "tensorrt_onnxruntime":
+        if onnx_uri is None:
+            raise ValueError(
+                "infer.user_tower_onnx_uri is required when infer.user_tower_backend='tensorrt_onnxruntime'"
+            )
+        try:
+            import onnxruntime as ort
+        except Exception as e:
+            raise RuntimeError(
+                "onnxruntime is required for tensorrt_onnxruntime backend. Install onnxruntime-gpu."
+            ) from e
+
+        onnx_local = _materialize_uri_to_local(onnx_uri, suffix=".onnx")
+        trt_cache = trt_engine_cache_path or str(Path(tempfile.gettempdir()) / "two_tower_trt_cache")
+        provider_options = [
+            {
+                "trt_fp16_enable": bool(trt_fp16_enable and use_amp and amp_dtype_torch == torch.float16),
+                "trt_engine_cache_enable": bool(trt_engine_cache_enable),
+                "trt_engine_cache_path": trt_cache,
+            },
+            {},
+            {},
+        ]
+        session = ort.InferenceSession(
+            onnx_local,
+            providers=[
+                "TensorrtExecutionProvider",
+                "CUDAExecutionProvider",
+                "CPUExecutionProvider",
+            ],
+            provider_options=provider_options,
+        )
+        out_name = session.get_outputs()[0].name
+        return OnnxRuntimeTensorRTUserTowerBackend(session=session, output_name=out_name, device=to_device), None
+
+    raise ValueError(f"Unsupported infer.user_tower_backend={backend_name!r}")
+
+
 def tt_infer_worker(
     worker_id: int,
     file_queue: Any,
@@ -229,6 +338,11 @@ def tt_infer_worker(
     infer_stream_batch_rows: int,
     workers_per_gpu: int,
     max_users_per_file: int | None,
+    user_tower_backend: str,
+    user_tower_onnx_uri: str | None,
+    trt_fp16_enable: bool,
+    trt_engine_cache_enable: bool,
+    trt_engine_cache_path: str | None,
 ) -> None:
     """Multiprocessing worker: load tower + client matrix once, consume parquet paths from ``file_queue``."""
     os.environ["POLARS_MAX_THREADS"] = "2"
@@ -264,39 +378,31 @@ def tt_infer_worker(
     umd = state.get("user_multi_emb_dims") or []
     mp = state.get("multi_cat_pool", "mean")
     use_pt_cat = bool(state.get("use_pretrained_cat", False))
-    arch = str(state.get("user_tower_arch", "dcnv2")).lower()
     hidden = state.get("user_hidden")
     if hidden is None:
         hidden = state.get("user_deep_hidden")
     hidden = list(hidden or [512, 512])
 
-    common_kwargs = dict(
-        user_vocab_sizes=expected_vocab_sizes,
-        user_num_dim=expected_num_dim,
+    backend, user_tower_model = _build_user_tower_backend(
+        backend_name=user_tower_backend,
+        onnx_uri=user_tower_onnx_uri,
+        to_device=to_device,
+        use_amp=use_amp,
+        amp_dtype_torch=amp_dtype_torch,
+        trt_fp16_enable=trt_fp16_enable,
+        trt_engine_cache_enable=trt_engine_cache_enable,
+        trt_engine_cache_path=trt_engine_cache_path,
+        expected_vocab_sizes=expected_vocab_sizes,
+        expected_num_dim=expected_num_dim,
         emb_dim=emb_dim,
-        user_multi_vocab_sizes=um if um else None,
-        user_multi_emb_dims=umd if umd else None,
-        multi_pool=mp,
-        use_pretrained_cat=use_pt_cat,
-        pretrained_emb_dim=int(state.get("pretrained_emb_dim", 128)),
-        target_cat_emb_dim=int(state.get("target_cat_emb_dim", 64)),
-        freeze_base=bool(state.get("freeze_base", True)),
+        um=list(um),
+        umd=list(umd),
+        mp=str(mp),
+        use_pt_cat=use_pt_cat,
+        hidden=hidden,
+        state=state,
     )
-    if arch == "mlp":
-        user_tower = UserMLPTower(hidden=hidden, **common_kwargs).to(to_device)
-    else:
-        user_tower = DCNv2UserTower(
-            num_cross_layers=int(state.get("num_cross_layers", 3)),
-            deep_hidden=hidden,
-            **common_kwargs,
-        ).to(to_device)
-    user_tower.load_state_dict(state["state_dict"])
-    user_tower.eval()
-    if hasattr(torch, "compile") and to_device.type == "cuda":
-        try:
-            user_tower = torch.compile(user_tower, mode="reduce-overhead")
-        except Exception:
-            pass
+    print(f"  Worker {worker_id} backend={backend.backend_name}", flush=True)
     del state
     gc.collect()
 
@@ -410,7 +516,7 @@ def tt_infer_worker(
                         expected_vocab_sizes=expected_vocab_sizes,
                         expected_cat_dim=expected_cat_dim,
                         expected_num_dim=expected_num_dim,
-                        user_tower=user_tower,
+                        user_tower_backend=backend,
                         client_emb_t=client_emb_t,
                         client_ids_np=client_ids_np,
                         topk=topk,
@@ -468,7 +574,7 @@ def tt_infer_worker(
                         expected_vocab_sizes=expected_vocab_sizes,
                         expected_cat_dim=expected_cat_dim,
                         expected_num_dim=expected_num_dim,
-                        user_tower=user_tower,
+                        user_tower_backend=backend,
                         client_emb_t=client_emb_t,
                         client_ids_np=client_ids_np,
                         topk=topk,
@@ -514,7 +620,9 @@ def tt_infer_worker(
     del client_emb_t, client_ids_np
     if to_device.type == "cuda":
         torch.cuda.empty_cache()
-    user_tower.cpu()
-    del user_tower
+    if user_tower_model is not None:
+        user_tower_model.cpu()
+        del user_tower_model
+    del backend
     gc.collect()
     print(f"  Worker {worker_id} finished. Total parts written: {part}", flush=True)
