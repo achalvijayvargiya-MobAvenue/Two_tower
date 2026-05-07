@@ -9,8 +9,6 @@ import contextlib
 from pathlib import Path
 from typing import Union
 
-import mlflow
-import mlflow.pytorch
 import numpy as np
 import pandas as pd
 import torch
@@ -193,6 +191,23 @@ def _safe_mlflow_key(s: object) -> str:
             out.append("_")
     cleaned = "".join(out).strip("_")
     return cleaned[:120] if cleaned else "unknown"
+
+
+def _maybe_import_mlflow() -> tuple[object | None, object | None]:
+    """
+    MLflow is optional.
+
+    We only import it when the user explicitly configured `mlflow_tracking_uri`.
+    This avoids creating local tracking stores (which can involve SQLite) when
+    MLflow is not being used.
+    """
+    try:
+        import mlflow  # type: ignore
+        import mlflow.pytorch  # type: ignore
+
+        return mlflow, mlflow.pytorch
+    except Exception:
+        return None, None
 
 
 def _client_group_metrics(
@@ -413,13 +428,26 @@ def train_and_log(
     criterion = nn.BCEWithLogitsLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=tc.lr, weight_decay=tc.weight_decay)
 
-    if _is_rank0():
-        setup_mlflow(cfg.mlflow_tracking_uri, tc.experiment_name)
+    use_mlflow = bool(_is_rank0() and getattr(cfg, "mlflow_tracking_uri", None))
+    mlflow, mlflow_pytorch = (None, None)
+    if use_mlflow:
+        mlflow, mlflow_pytorch = _maybe_import_mlflow()
+        if mlflow is None:
+            use_mlflow = False
+            if _is_rank0():
+                print(
+                    "MLflow tracking is configured (mlflow_tracking_uri is set) but `mlflow` is not installed. "
+                    "Continuing without MLflow logging."
+                )
+        else:
+            setup_mlflow(cfg.mlflow_tracking_uri, tc.experiment_name)
 
     try:
-        mlflow_ctx = mlflow.start_run(run_name=tc.run_name) if _is_rank0() else contextlib.nullcontext()
+        mlflow_ctx = (
+            mlflow.start_run(run_name=tc.run_name) if (use_mlflow and mlflow is not None) else contextlib.nullcontext()
+        )
         with mlflow_ctx:
-            if _is_rank0():
+            if use_mlflow and _is_rank0() and mlflow is not None:
                 mlflow.log_params(
                     {
                         "batch_size_global": tc.batch_size,
@@ -722,7 +750,7 @@ def train_and_log(
                         metrics_to_log[f"train_client__{k}__logloss"] = float(met.get("logloss", float("nan")))
                         metrics_to_log[f"train_client__{k}__pos_rate"] = float(met.get("label_pos_rate", float("nan")))
                         metrics_to_log[f"train_client__{k}__n"] = float(met.get("_n", float("nan")))
-            if _is_rank0():
+            if use_mlflow and _is_rank0() and mlflow is not None:
                 mlflow.log_metrics(metrics_to_log, step=epoch)
 
             if _is_rank0():
@@ -793,7 +821,8 @@ def train_and_log(
                 best_user_state = best_snapshot["user_tower"]
                 best_client_state = best_snapshot["client_tower"]
                 ckpt_selection = "best_val_auc"
-                mlflow.log_metrics({"best_val_auc": best_val_auc, "best_epoch": float(best_epoch)}, step=tc.epochs)
+                if use_mlflow and mlflow is not None:
+                    mlflow.log_metrics({"best_val_auc": best_val_auc, "best_epoch": float(best_epoch)}, step=tc.epochs)
                 print(
                     f"Best epoch: {best_epoch + 1}/{tc.epochs} val_auc={best_val_auc:.4f} "
                     "(weights exported to artifacts + MLflow)."
@@ -818,16 +847,16 @@ def train_and_log(
                 _ex.client_num.numpy(),
                 _ex.client_multi.numpy(),
             ]
-            try:
-                mlflow.pytorch.log_model(
-                    m,
-                    name="model",
-                    input_example=input_example,
-                    serialization_format="pt2",
-                )
-            except Exception as e:
-                print(f"MLflow pt2 export failed ({e!r}); falling back to pickle serialization.")
-                mlflow.pytorch.log_model(m, name="model", input_example=input_example)
+            if use_mlflow and mlflow is not None and mlflow_pytorch is not None:
+                try:
+                    mlflow_pytorch.log_model(
+                        m,
+                        name="model",
+                        input_example=input_example,
+                        serialization_format="pt2",
+                    )
+                except Exception as e:
+                    print(f"MLflow export failed ({e!r}); skipping MLflow model logging.")
 
             base = cfg.paths.artifacts_base
             user_tower_uri = artifact_uri(base, "artifacts", "user_tower", "user_tower_state.pt")
