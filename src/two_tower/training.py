@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import io
 import math
-import pickle
-import time
 import os
+import pickle
+import sys
+import time
 import contextlib
 from pathlib import Path
 from typing import Union
@@ -486,6 +487,14 @@ def train_and_log(
 
             last_hb = time.time()
             hb_every_s = 300.0  # 5 minutes
+            if _is_rank0():
+                _banner = (
+                    f"[train_and_log] loop_config early_stopping_patience={es_patience} "
+                    f"max_epochs={tc.epochs} freeze_pretrained_base={tc.freeze_pretrained_base} "
+                    f"| code={__file__}"
+                )
+                print(_banner, flush=True)
+                runlog.write(_banner)
             for epoch in range(tc.epochs):
                 model.train()
                 total_loss = 0.0
@@ -691,7 +700,7 @@ def train_and_log(
                         "log_scale": m.log_scale.detach().cpu().clone(),
                     }
                     if _is_rank0():
-                        print(f"  -> new best val_auc={best_val_auc:.4f} (epoch {epoch + 1})")
+                        print(f"  -> new best val_auc={best_val_auc:.4f} (epoch {epoch + 1})", flush=True)
 
                 _scale_val = m.log_scale.clamp(math.log(1.0), math.log(100.0)).exp().item()
                 metrics_to_log = {
@@ -767,13 +776,14 @@ def train_and_log(
                         f"val_pr_auc={val_metrics['auc_pr']:.4f} | "
                         f"val_prec={val_metrics['precision']:.4f} val_rec={val_metrics['recall']:.4f} "
                         f"val_f1={val_metrics['f1']:.4f} | scale={_scale_val:.2f} | "
-                        f"val_nonfinite uemb={val_uemb_bad} cemb={val_cemb_bad} logits={val_logits_nonfinite}"
+                        f"val_nonfinite uemb={val_uemb_bad} cemb={val_cemb_bad} logits={val_logits_nonfinite}",
+                        flush=True,
                     )
                     if per_client_metrics:
                         parts = []
                         for cid, met in per_client_metrics.items():
                             parts.append(f"{_safe_mlflow_key(cid)}={float(met.get('auc_roc', float('nan'))):.4f}")
-                        print("           val_client_auc:", ", ".join(parts))
+                        print("           val_client_auc:", ", ".join(parts), flush=True)
                     if train_metrics is not None:
                         print(
                             f"           train_auc={train_metrics['auc_roc']:.4f} train_pr_auc={train_metrics['auc_pr']:.4f} "
@@ -781,13 +791,15 @@ def train_and_log(
                             f"train_f1={train_metrics['f1']:.4f} "
                             f"train_auc_macro={train_client_summary['macro_auc']:.4f} "
                             f"train_auc_worst={train_client_summary['worst_client_auc']:.4f} "
-                            f"(sample_n={train_eval_kept})"
+                            f"(sample_n={train_eval_kept})",
+                            flush=True,
                         )
                         if train_client_metrics:
                             parts = []
                             for cid, met in train_client_metrics.items():
                                 parts.append(f"{_safe_mlflow_key(cid)}={float(met.get('auc_roc', float('nan'))):.4f}")
-                            print("           train_client_auc:", ", ".join(parts))
+                            print("           train_client_auc:", ", ".join(parts), flush=True)
+                    sys.stdout.flush()
                     runlog.write(
                         "EPOCH_DONE "
                         f"epoch={epoch + 1}/{tc.epochs} "
@@ -848,7 +860,7 @@ def train_and_log(
                             f"patience={es_patience} best_epoch={best_epoch + 1} "
                             f"best_val_auc={best_val_auc:.6f} stopped_after_epoch={epoch + 1}"
                         )
-                        print(msg)
+                        print(msg, flush=True)
                         runlog.write(msg)
                 if is_dist and dist.is_initialized():
                     st = torch.tensor([1 if stop_training else 0], dtype=torch.int32, device=device)
@@ -871,7 +883,8 @@ def train_and_log(
                 suffix = f" (early stop after {epoch + 1} epochs)" if stopped_early else ""
                 print(
                     f"Best epoch: {best_epoch + 1}/{tc.epochs} val_auc={best_val_auc:.4f} "
-                    f"(weights exported to artifacts + MLflow).{suffix}"
+                    f"(weights exported to artifacts + MLflow).{suffix}",
+                    flush=True,
                 )
             else:
                 best_user_state = {k: v.detach().cpu().clone() for k, v in m.user_tower.state_dict().items()}
