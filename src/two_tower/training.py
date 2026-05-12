@@ -479,6 +479,10 @@ def train_and_log(
             best_val_auc = float("-inf")
             best_epoch = -1
             best_snapshot: dict | None = None
+            epochs_no_improve = 0
+            stopped_early = False
+            es_patience_raw = getattr(tc, "early_stopping_patience", None)
+            es_patience = int(es_patience_raw) if es_patience_raw not in (None, "", 0) else 0
 
             last_hb = time.time()
             hb_every_s = 300.0  # 5 minutes
@@ -673,7 +677,8 @@ def train_and_log(
                     per_client_metrics = {}
                     client_summary = {"macro_auc": float("nan"), "worst_client_auc": float("nan")}
 
-                if np.isfinite(val_auc) and val_auc > best_val_auc:
+                improved_this_epoch = bool(np.isfinite(val_auc) and val_auc > best_val_auc)
+                if improved_this_epoch:
                     best_val_auc = val_auc
                     best_epoch = epoch
                     best_snapshot = {
@@ -688,133 +693,170 @@ def train_and_log(
                     if _is_rank0():
                         print(f"  -> new best val_auc={best_val_auc:.4f} (epoch {epoch + 1})")
 
-            _scale_val = m.log_scale.clamp(math.log(1.0), math.log(100.0)).exp().item()
-            metrics_to_log = {
-                "train_loss": avg_train_loss,
-                "val_loss": avg_val_loss,
-                "val_uemb_nonfinite_rows": float(val_uemb_bad),
-                "val_cemb_nonfinite_rows": float(val_cemb_bad),
-                "val_logits_nonfinite_cells": float(val_logits_nonfinite),
-                "temperature_scale": _scale_val,
-                # validation (rich)
-                "val_auc": float(val_metrics["auc_roc"]),
-                "val_auc_pr": float(val_metrics["auc_pr"]),
-                "val_precision": float(val_metrics["precision"]),
-                "val_recall": float(val_metrics["recall"]),
-                "val_f1": float(val_metrics["f1"]),
-                "val_accuracy": float(val_metrics["accuracy"]),
-                "val_logloss": float(val_metrics["logloss"]),
-                "val_label_pos_rate": float(val_metrics["label_pos_rate"]),
-                "val_tn": float(val_metrics["tn"]),
-                "val_fp": float(val_metrics["fp"]),
-                "val_fn": float(val_metrics["fn"]),
-                "val_tp": float(val_metrics["tp"]),
-                "val_auc_macro_client": float(client_summary["macro_auc"]),
-                "val_auc_worst_client": float(client_summary["worst_client_auc"]),
-            }
-            if _is_rank0() and per_client_metrics:
-                # Log per-client metrics for debugging/fairness tracking.
-                for cid, met in per_client_metrics.items():
-                    k = _safe_mlflow_key(cid)
-                    metrics_to_log[f"val_client__{k}__auc"] = float(met.get("auc_roc", float("nan")))
-                    metrics_to_log[f"val_client__{k}__auc_pr"] = float(met.get("auc_pr", float("nan")))
-                    metrics_to_log[f"val_client__{k}__precision"] = float(met.get("precision", float("nan")))
-                    metrics_to_log[f"val_client__{k}__recall"] = float(met.get("recall", float("nan")))
-                    metrics_to_log[f"val_client__{k}__f1"] = float(met.get("f1", float("nan")))
-                    metrics_to_log[f"val_client__{k}__logloss"] = float(met.get("logloss", float("nan")))
-                    metrics_to_log[f"val_client__{k}__pos_rate"] = float(met.get("label_pos_rate", float("nan")))
-                    metrics_to_log[f"val_client__{k}__n"] = float(met.get("_n", float("nan")))
-            if train_metrics is not None:
-                metrics_to_log.update(
-                    {
-                        "train_auc": float(train_metrics["auc_roc"]),
-                        "train_auc_pr": float(train_metrics["auc_pr"]),
-                        "train_precision": float(train_metrics["precision"]),
-                        "train_recall": float(train_metrics["recall"]),
-                        "train_f1": float(train_metrics["f1"]),
-                        "train_accuracy": float(train_metrics["accuracy"]),
-                        "train_logloss": float(train_metrics["logloss"]),
-                        "train_label_pos_rate": float(train_metrics["label_pos_rate"]),
-                        "train_auc_macro_client": float(train_client_summary["macro_auc"]),
-                        "train_auc_worst_client": float(train_client_summary["worst_client_auc"]),
-                    }
-                )
-                if _is_rank0() and train_client_metrics:
-                    for cid, met in train_client_metrics.items():
-                        k = _safe_mlflow_key(cid)
-                        metrics_to_log[f"train_client__{k}__auc"] = float(met.get("auc_roc", float("nan")))
-                        metrics_to_log[f"train_client__{k}__auc_pr"] = float(met.get("auc_pr", float("nan")))
-                        metrics_to_log[f"train_client__{k}__precision"] = float(met.get("precision", float("nan")))
-                        metrics_to_log[f"train_client__{k}__recall"] = float(met.get("recall", float("nan")))
-                        metrics_to_log[f"train_client__{k}__f1"] = float(met.get("f1", float("nan")))
-                        metrics_to_log[f"train_client__{k}__logloss"] = float(met.get("logloss", float("nan")))
-                        metrics_to_log[f"train_client__{k}__pos_rate"] = float(met.get("label_pos_rate", float("nan")))
-                        metrics_to_log[f"train_client__{k}__n"] = float(met.get("_n", float("nan")))
-            if use_mlflow and _is_rank0() and mlflow is not None:
-                mlflow.log_metrics(metrics_to_log, step=epoch)
-
-            if _is_rank0():
-                print(
-                    f"Epoch {epoch + 1}/{tc.epochs} | train_loss={avg_train_loss:.4f} | "
-                    f"val_loss={avg_val_loss:.4f} | val_auc={val_metrics['auc_roc']:.4f} | "
-                    f"val_auc_macro={client_summary['macro_auc']:.4f} "
-                    f"val_auc_worst={client_summary['worst_client_auc']:.4f} | "
-                    f"val_pr_auc={val_metrics['auc_pr']:.4f} | "
-                    f"val_prec={val_metrics['precision']:.4f} val_rec={val_metrics['recall']:.4f} "
-                    f"val_f1={val_metrics['f1']:.4f} | scale={_scale_val:.2f} | "
-                    f"val_nonfinite uemb={val_uemb_bad} cemb={val_cemb_bad} logits={val_logits_nonfinite}"
-                )
-                if per_client_metrics:
-                    parts = []
+                _scale_val = m.log_scale.clamp(math.log(1.0), math.log(100.0)).exp().item()
+                metrics_to_log = {
+                    "train_loss": avg_train_loss,
+                    "val_loss": avg_val_loss,
+                    "val_uemb_nonfinite_rows": float(val_uemb_bad),
+                    "val_cemb_nonfinite_rows": float(val_cemb_bad),
+                    "val_logits_nonfinite_cells": float(val_logits_nonfinite),
+                    "temperature_scale": _scale_val,
+                    # validation (rich)
+                    "val_auc": float(val_metrics["auc_roc"]),
+                    "val_auc_pr": float(val_metrics["auc_pr"]),
+                    "val_precision": float(val_metrics["precision"]),
+                    "val_recall": float(val_metrics["recall"]),
+                    "val_f1": float(val_metrics["f1"]),
+                    "val_accuracy": float(val_metrics["accuracy"]),
+                    "val_logloss": float(val_metrics["logloss"]),
+                    "val_label_pos_rate": float(val_metrics["label_pos_rate"]),
+                    "val_tn": float(val_metrics["tn"]),
+                    "val_fp": float(val_metrics["fp"]),
+                    "val_fn": float(val_metrics["fn"]),
+                    "val_tp": float(val_metrics["tp"]),
+                    "val_auc_macro_client": float(client_summary["macro_auc"]),
+                    "val_auc_worst_client": float(client_summary["worst_client_auc"]),
+                }
+                if _is_rank0() and per_client_metrics:
+                    # Log per-client metrics for debugging/fairness tracking.
                     for cid, met in per_client_metrics.items():
-                        parts.append(f"{_safe_mlflow_key(cid)}={float(met.get('auc_roc', float('nan'))):.4f}")
-                    print("           val_client_auc:", ", ".join(parts))
+                        k = _safe_mlflow_key(cid)
+                        metrics_to_log[f"val_client__{k}__auc"] = float(met.get("auc_roc", float("nan")))
+                        metrics_to_log[f"val_client__{k}__auc_pr"] = float(met.get("auc_pr", float("nan")))
+                        metrics_to_log[f"val_client__{k}__precision"] = float(met.get("precision", float("nan")))
+                        metrics_to_log[f"val_client__{k}__recall"] = float(met.get("recall", float("nan")))
+                        metrics_to_log[f"val_client__{k}__f1"] = float(met.get("f1", float("nan")))
+                        metrics_to_log[f"val_client__{k}__logloss"] = float(met.get("logloss", float("nan")))
+                        metrics_to_log[f"val_client__{k}__pos_rate"] = float(met.get("label_pos_rate", float("nan")))
+                        metrics_to_log[f"val_client__{k}__n"] = float(met.get("_n", float("nan")))
                 if train_metrics is not None:
-                    print(
-                        f"           train_auc={train_metrics['auc_roc']:.4f} train_pr_auc={train_metrics['auc_pr']:.4f} "
-                        f"train_prec={train_metrics['precision']:.4f} train_rec={train_metrics['recall']:.4f} "
-                        f"train_f1={train_metrics['f1']:.4f} "
-                        f"train_auc_macro={train_client_summary['macro_auc']:.4f} "
-                        f"train_auc_worst={train_client_summary['worst_client_auc']:.4f} "
-                        f"(sample_n={train_eval_kept})"
+                    metrics_to_log.update(
+                        {
+                            "train_auc": float(train_metrics["auc_roc"]),
+                            "train_auc_pr": float(train_metrics["auc_pr"]),
+                            "train_precision": float(train_metrics["precision"]),
+                            "train_recall": float(train_metrics["recall"]),
+                            "train_f1": float(train_metrics["f1"]),
+                            "train_accuracy": float(train_metrics["accuracy"]),
+                            "train_logloss": float(train_metrics["logloss"]),
+                            "train_label_pos_rate": float(train_metrics["label_pos_rate"]),
+                            "train_auc_macro_client": float(train_client_summary["macro_auc"]),
+                            "train_auc_worst_client": float(train_client_summary["worst_client_auc"]),
+                        }
                     )
+                    if _is_rank0() and train_client_metrics:
+                        for cid, met in train_client_metrics.items():
+                            k = _safe_mlflow_key(cid)
+                            metrics_to_log[f"train_client__{k}__auc"] = float(met.get("auc_roc", float("nan")))
+                            metrics_to_log[f"train_client__{k}__auc_pr"] = float(met.get("auc_pr", float("nan")))
+                            metrics_to_log[f"train_client__{k}__precision"] = float(met.get("precision", float("nan")))
+                            metrics_to_log[f"train_client__{k}__recall"] = float(met.get("recall", float("nan")))
+                            metrics_to_log[f"train_client__{k}__f1"] = float(met.get("f1", float("nan")))
+                            metrics_to_log[f"train_client__{k}__logloss"] = float(met.get("logloss", float("nan")))
+                            metrics_to_log[f"train_client__{k}__pos_rate"] = float(met.get("label_pos_rate", float("nan")))
+                            metrics_to_log[f"train_client__{k}__n"] = float(met.get("_n", float("nan")))
+                if use_mlflow and _is_rank0() and mlflow is not None:
+                    mlflow.log_metrics(metrics_to_log, step=epoch)
+
+                if _is_rank0():
+                    print(
+                        f"Epoch {epoch + 1}/{tc.epochs} | train_loss={avg_train_loss:.4f} | "
+                        f"val_loss={avg_val_loss:.4f} | val_auc={val_metrics['auc_roc']:.4f} | "
+                        f"val_auc_macro={client_summary['macro_auc']:.4f} "
+                        f"val_auc_worst={client_summary['worst_client_auc']:.4f} | "
+                        f"val_pr_auc={val_metrics['auc_pr']:.4f} | "
+                        f"val_prec={val_metrics['precision']:.4f} val_rec={val_metrics['recall']:.4f} "
+                        f"val_f1={val_metrics['f1']:.4f} | scale={_scale_val:.2f} | "
+                        f"val_nonfinite uemb={val_uemb_bad} cemb={val_cemb_bad} logits={val_logits_nonfinite}"
+                    )
+                    if per_client_metrics:
+                        parts = []
+                        for cid, met in per_client_metrics.items():
+                            parts.append(f"{_safe_mlflow_key(cid)}={float(met.get('auc_roc', float('nan'))):.4f}")
+                        print("           val_client_auc:", ", ".join(parts))
+                    if train_metrics is not None:
+                        print(
+                            f"           train_auc={train_metrics['auc_roc']:.4f} train_pr_auc={train_metrics['auc_pr']:.4f} "
+                            f"train_prec={train_metrics['precision']:.4f} train_rec={train_metrics['recall']:.4f} "
+                            f"train_f1={train_metrics['f1']:.4f} "
+                            f"train_auc_macro={train_client_summary['macro_auc']:.4f} "
+                            f"train_auc_worst={train_client_summary['worst_client_auc']:.4f} "
+                            f"(sample_n={train_eval_kept})"
+                        )
+                        if train_client_metrics:
+                            parts = []
+                            for cid, met in train_client_metrics.items():
+                                parts.append(f"{_safe_mlflow_key(cid)}={float(met.get('auc_roc', float('nan'))):.4f}")
+                            print("           train_client_auc:", ", ".join(parts))
+                    runlog.write(
+                        "EPOCH_DONE "
+                        f"epoch={epoch + 1}/{tc.epochs} "
+                        f"train_loss={avg_train_loss:.6f} "
+                        f"val_loss={avg_val_loss:.6f} "
+                        f"val_auc={val_metrics['auc_roc']:.6f} val_auc_pr={val_metrics['auc_pr']:.6f} "
+                        f"val_prec={val_metrics['precision']:.6f} val_rec={val_metrics['recall']:.6f} "
+                        f"val_f1={val_metrics['f1']:.6f} val_acc={val_metrics['accuracy']:.6f} "
+                        f"val_logloss={val_metrics['logloss']:.6f} "
+                        f"val_label_pos_rate={val_metrics['label_pos_rate']:.6f} "
+                        f"val_auc_macro_client={client_summary['macro_auc']:.6f} "
+                        f"val_auc_worst_client={client_summary['worst_client_auc']:.6f} "
+                        f"val_cm_tn={int(val_metrics['tn'])} val_cm_fp={int(val_metrics['fp'])} "
+                        f"val_cm_fn={int(val_metrics['fn'])} val_cm_tp={int(val_metrics['tp'])}"
+                    )
+                    if train_metrics is not None:
+                        runlog.write(
+                            "EPOCH_TRAIN_SAMPLE "
+                            f"epoch={epoch + 1}/{tc.epochs} sample_n={train_eval_kept} "
+                            f"train_auc={train_metrics['auc_roc']:.6f} train_auc_pr={train_metrics['auc_pr']:.6f} "
+                            f"train_prec={train_metrics['precision']:.6f} train_rec={train_metrics['recall']:.6f} "
+                            f"train_f1={train_metrics['f1']:.6f} train_acc={train_metrics['accuracy']:.6f} "
+                            f"train_logloss={train_metrics['logloss']:.6f} "
+                            f"train_auc_macro_client={train_client_summary['macro_auc']:.6f} "
+                            f"train_auc_worst_client={train_client_summary['worst_client_auc']:.6f}"
+                        )
+                    if per_client_metrics:
+                        parts = []
+                        for cid, met in per_client_metrics.items():
+                            parts.append(
+                                f"{_safe_mlflow_key(cid)}:"
+                                f"n={int(float(met.get('_n', float('nan')))) if np.isfinite(float(met.get('_n', float('nan')))) else -1}"
+                                f" pos={float(met.get('label_pos_rate', float('nan'))):.4f}"
+                                f" auc={float(met.get('auc_roc', float('nan'))):.4f}"
+                            )
+                        runlog.write("VAL_CLIENT_AUC " + " ".join(parts))
                     if train_client_metrics:
                         parts = []
                         for cid, met in train_client_metrics.items():
-                            parts.append(f"{_safe_mlflow_key(cid)}={float(met.get('auc_roc', float('nan'))):.4f}")
-                        print("           train_client_auc:", ", ".join(parts))
-                runlog.write(
-                    "EPOCH_DONE "
-                    f"epoch={epoch + 1}/{tc.epochs} "
-                    f"train_loss={avg_train_loss:.6f} "
-                    f"val_loss={avg_val_loss:.6f} "
-                    f"val_auc={val_metrics['auc_roc']:.6f} val_auc_pr={val_metrics['auc_pr']:.6f} "
-                    f"val_prec={val_metrics['precision']:.6f} val_rec={val_metrics['recall']:.6f} "
-                    f"val_f1={val_metrics['f1']:.6f} val_acc={val_metrics['accuracy']:.6f} "
-                    f"val_logloss={val_metrics['logloss']:.6f} "
-                    f"val_cm_tn={int(val_metrics['tn'])} val_cm_fp={int(val_metrics['fp'])} "
-                    f"val_cm_fn={int(val_metrics['fn'])} val_cm_tp={int(val_metrics['tp'])}"
-                )
-                if per_client_metrics:
-                    parts = []
-                    for cid, met in per_client_metrics.items():
-                        parts.append(
-                            f"{_safe_mlflow_key(cid)}:"
-                            f"n={int(float(met.get('_n', float('nan')))) if np.isfinite(float(met.get('_n', float('nan')))) else -1}"
-                            f" pos={float(met.get('label_pos_rate', float('nan'))):.4f}"
-                            f" auc={float(met.get('auc_roc', float('nan'))):.4f}"
+                            parts.append(
+                                f"{_safe_mlflow_key(cid)}:"
+                                f"n={int(float(met.get('_n', float('nan')))) if np.isfinite(float(met.get('_n', float('nan')))) else -1}"
+                                f" pos={float(met.get('label_pos_rate', float('nan'))):.4f}"
+                                f" auc={float(met.get('auc_roc', float('nan'))):.4f}"
+                            )
+                        runlog.write("TRAIN_CLIENT_AUC " + " ".join(parts))
+
+                stop_training = False
+                if _is_rank0() and es_patience > 0 and np.isfinite(val_auc):
+                    if improved_this_epoch:
+                        epochs_no_improve = 0
+                    else:
+                        epochs_no_improve += 1
+                    if epochs_no_improve >= es_patience:
+                        stop_training = True
+                        msg = (
+                            f"EARLY_STOP no_val_auc_improve_for={epochs_no_improve} "
+                            f"patience={es_patience} best_epoch={best_epoch + 1} "
+                            f"best_val_auc={best_val_auc:.6f} stopped_after_epoch={epoch + 1}"
                         )
-                    runlog.write("VAL_CLIENT_AUC " + " ".join(parts))
-                if train_client_metrics:
-                    parts = []
-                    for cid, met in train_client_metrics.items():
-                        parts.append(
-                            f"{_safe_mlflow_key(cid)}:"
-                            f"n={int(float(met.get('_n', float('nan')))) if np.isfinite(float(met.get('_n', float('nan')))) else -1}"
-                            f" pos={float(met.get('label_pos_rate', float('nan'))):.4f}"
-                            f" auc={float(met.get('auc_roc', float('nan'))):.4f}"
-                        )
-                    runlog.write("TRAIN_CLIENT_AUC " + " ".join(parts))
+                        print(msg)
+                        runlog.write(msg)
+                if is_dist and dist.is_initialized():
+                    st = torch.tensor([1 if stop_training else 0], dtype=torch.int32, device=device)
+                    dist.broadcast(st, src=0)
+                    stop_training = bool(st[0].item())
+                if stop_training:
+                    stopped_early = True
+                    break
 
         if _is_rank0():
             if best_snapshot is not None:
@@ -822,10 +864,14 @@ def train_and_log(
                 best_client_state = best_snapshot["client_tower"]
                 ckpt_selection = "best_val_auc"
                 if use_mlflow and mlflow is not None:
-                    mlflow.log_metrics({"best_val_auc": best_val_auc, "best_epoch": float(best_epoch)}, step=tc.epochs)
+                    mlflow.log_metrics(
+                        {"best_val_auc": best_val_auc, "best_epoch": float(best_epoch)},
+                        step=int(epoch),
+                    )
+                suffix = f" (early stop after {epoch + 1} epochs)" if stopped_early else ""
                 print(
                     f"Best epoch: {best_epoch + 1}/{tc.epochs} val_auc={best_val_auc:.4f} "
-                    "(weights exported to artifacts + MLflow)."
+                    f"(weights exported to artifacts + MLflow).{suffix}"
                 )
             else:
                 best_user_state = {k: v.detach().cpu().clone() for k, v in m.user_tower.state_dict().items()}

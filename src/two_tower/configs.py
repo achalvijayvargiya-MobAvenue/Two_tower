@@ -74,6 +74,9 @@ class TrainConfig:
     downsample_equalize_client_rows: bool = True
     downsample_random_state: int = 42
 
+    # Stop after N consecutive epochs without improvement in val ROC-AUC (None / 0 = disabled).
+    early_stopping_patience: int | None = None
+
     # Batch-level balancing (does NOT change dataset size; affects only sampling into batches).
     # When enabled, batches are constructed to match global per-client frequency and enforce a
     # per-client negative-to-positive ratio (e.g. 3 means 3 negatives per positive).

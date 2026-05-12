@@ -184,6 +184,11 @@ train:
   batch_balance_neg_per_pos: 3
   train_eval_max_examples: 200000
   train_client_eval_max_examples: 200000
+  # Stop if val ROC-AUC does not improve for this many epochs (restores best weights as before).
+  early_stopping_patience: 5
+  # Full data from paths; pipeline downsampling off (orchestrator Step 3a also set to skip).
+  downsample_train: false
+  downsample_val: false
   lr: 0.001
   weight_decay: 0.0
   embed_dim: 1024
@@ -194,7 +199,7 @@ train:
   device: cuda
   pretrained_emb_dim: 128
   pretrained_cat_emb_dim: 128
-  freeze_pretrained_base: false
+  freeze_pretrained_base: true
   multi_cat_pool: mean
   client_mlp_hidden:
   - 128

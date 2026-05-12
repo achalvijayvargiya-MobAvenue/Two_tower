@@ -143,6 +143,9 @@ def load_pipeline_config(path: str | Path) -> PipelineConfig:
         else None,
         downsample_equalize_client_rows=bool(t.get("downsample_equalize_client_rows", True)),
         downsample_random_state=int(t.get("downsample_random_state", 42)),
+        early_stopping_patience=int(t["early_stopping_patience"])
+        if t.get("early_stopping_patience") not in (None, "", 0)
+        else None,
         batch_balance=bool(t.get("batch_balance", False)),
         batch_balance_neg_per_pos=int(t.get("batch_balance_neg_per_pos", 3)),
         pretrained_emb_dim=int(t.get("pretrained_emb_dim", 128)),
