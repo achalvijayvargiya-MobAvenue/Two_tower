@@ -9,21 +9,12 @@ features:
   client_id_col: client_bundle_id
   # Short names from ref.txt (Original->Short). Ranges expanded: b_app_1..5 -> ba1..ba5, etc. label not a feature.
   user_feature_cols:
-  - dev_id
-  - dev_mk
-  - dev_md
-  - car
-  - os_v
-  - con_t
-  - city
-  - state
   - c_tier
   - geo_r
   - inc_b
   - dist_pop
   - metro
   - cap
-  - coast
   - smart
   - ut_cap
   - coast_c
@@ -38,8 +29,6 @@ features:
   - tex_hub
   - edu_hub
   - tour
-  - lat
-  - lon
   - dist_cap
   - lit_r
   - med_age
@@ -47,15 +36,11 @@ features:
   - dpi
   - inet_p
   - smp_p
-  - dist_pop_n
   - sex_r
   - msl
   - pr_inr
   - ram
   - stor
-  - rec
-  - fsd
-  - lud
   - inv_r
   - cry_r
   - fin_r
@@ -78,10 +63,6 @@ features:
   - csl_r
   - brd_r
   - arc_r
-  - s45_c
-  - s4045_c
-  - s3040_c
-  - slt30_c
   - msm_c
   - pop_c
   - mid_c
@@ -97,17 +78,6 @@ features:
   - day_a
   - eve_a
   - ngt_a
-  - tot_ev
-  - org_ev
-  - bid_ev
-  - tot_ap
-  - ubid_ap
-  - uorg_ap
-  - ba1
-  - ba2
-  - ba3
-  - ba4
-  - ba5
   - bg1
   - bg2
   - bg3
@@ -123,7 +93,6 @@ features:
   - og3
   - geo_dpi
   - geo_inc
-  - geo_con
   - mhi_f
   - geo_inet
   - ctier_pop
