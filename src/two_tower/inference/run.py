@@ -60,7 +60,24 @@ def run_inference_job(cfg: InferJobConfig) -> None:
         f"max_files={ic.max_files} max_users_per_file={ic.max_users_per_file}"
     )
 
-    ctx = multiprocessing.get_context("spawn")
+    # Jupyter/IPython notebooks + multiprocessing "spawn" can fail because the worker function
+    # ends up living in `__main__` (not importable in child processes). On Linux, "fork"
+    # avoids pickling the target and is the most compatible for notebooks.
+    #
+    # For CLI/prod-like execution, we keep the safer default of "spawn".
+    start_method = "spawn"
+    try:
+        in_notebook = bool(getattr(__import__("builtins"), "get_ipython", None))
+    except Exception:
+        in_notebook = False
+    if in_notebook:
+        try:
+            methods = multiprocessing.get_all_start_methods()
+        except Exception:
+            methods = []
+        if "fork" in methods:
+            start_method = "fork"
+    ctx = multiprocessing.get_context(start_method)
     file_queue = ctx.Queue()
     status_queue = ctx.Queue()
 

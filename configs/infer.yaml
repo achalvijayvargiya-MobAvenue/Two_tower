@@ -3,7 +3,7 @@ paths:
   artifacts_base: "s3://mobavenue-simplismart-aws-s3-apse-sg/rtb/data/two_tower_ml/3_Client/"
 
 features:
-  device_id_col: "device_id"
+  device_id_col: "dev_id"
   user_feature_cols: []
   user_multi_cols: []
 
