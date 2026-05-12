@@ -133,6 +133,9 @@ class InferenceConfig:
     max_files: int | None = None
     max_users_per_file: int | None = None
 
+    # Name of the device/user identifier column in ranking output Parquet (Athena-friendly).
+    ranking_device_id_col: str = "device_id"
+
 
 @dataclass(frozen=True)
 class InferPaths:
@@ -146,6 +149,9 @@ class InferPaths:
 class InferJobConfig:
     paths: InferPaths
     infer: InferenceConfig
+    # Optional: first candidate when resolving which Parquet column holds the device id (see worker).
+    # If None, only the training vocab name + built-in fallbacks are used.
+    infer_parquet_device_id_col: str | None = None
 
 
 @dataclass(frozen=True)

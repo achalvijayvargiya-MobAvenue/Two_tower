@@ -2,12 +2,18 @@ paths:
   infer: "s3://mobavenue-simplismart-aws-s3-apse-sg/rtb/data/two_tower_ml/test_data_final/20260501_full_v2/"
   artifacts_base: "s3://mobavenue-simplismart-aws-s3-apse-sg/rtb/data/two_tower_ml/3_Client/"
 
+# device_id_col: optional first candidate when resolving the Parquet column for the user/device id.
+# Inference also tries the training vocab name, then device_id, dev_id, ifa, advertising_id.
+# If two columns exist (e.g. empty dev_id + populated device_id), the worker picks the one with
+# more non-null values in the first batch peek.
 features:
   device_id_col: "dev_id"
   user_feature_cols: []
   user_multi_cols: []
 
 infer:
+  # Column name written to ranking Parquet (match your Athena/Glue table DDL).
+  ranking_device_id_col: "device_id"
   topk_clients: 3
   infer_stream_batch_rows: 65536
   num_physical_gpus: 4

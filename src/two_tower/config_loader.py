@@ -49,6 +49,7 @@ def _parse_inference_section(i: dict, *, path_label: str) -> InferenceConfig:
         max_users_per_file=int(i["max_users_per_file"])
         if i.get("max_users_per_file") not in (None, "", 0)
         else None,
+        ranking_device_id_col=str(i.get("ranking_device_id_col", "device_id")),
     )
 
 
@@ -64,7 +65,17 @@ def load_infer_job_config(path: str | Path) -> InferJobConfig:
             raise KeyError(f"paths.{k} is required in {path}")
     paths = InferPaths(infer=str(p["infer"]), artifacts_base=str(p["artifacts_base"]))
     infer = _parse_inference_section(raw.get("infer") or {}, path_label=str(path))
-    return InferJobConfig(paths=paths, infer=infer)
+    feat = raw.get("features") or {}
+    infer_parquet_device_id_col = feat.get("device_id_col")
+    if infer_parquet_device_id_col in (None, ""):
+        infer_parquet_device_id_col = None
+    else:
+        infer_parquet_device_id_col = str(infer_parquet_device_id_col)
+    return InferJobConfig(
+        paths=paths,
+        infer=infer,
+        infer_parquet_device_id_col=infer_parquet_device_id_col,
+    )
 
 
 def load_pipeline_config(path: str | Path) -> PipelineConfig:

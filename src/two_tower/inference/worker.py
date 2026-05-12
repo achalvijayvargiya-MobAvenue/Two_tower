@@ -111,10 +111,55 @@ def _encode_multi_matrix_pl(
     return torch.from_numpy(out)
 
 
+def _resolve_source_device_id_column(
+    parquet_path: str,
+    candidates: list[str],
+    peek_batch_rows: int,
+    worker_id: int,
+) -> str:
+    """Pick which Parquet column holds the user/device id (handles dev_id vs device_id, null stubs)."""
+    dset = pads.dataset(parquet_path, format="parquet")
+    names = set(dset.schema.names)
+    present = [c for c in candidates if c in names]
+    if not present:
+        sample = sorted(names)
+        tail = " …" if len(sample) > 80 else ""
+        sample = sample[:80]
+        raise ValueError(
+            f"No device id column found in {parquet_path!r}. Tried {candidates!r}. "
+            f"Schema has {len(names)} columns (sample): {sample}{tail}"
+        )
+    if len(present) == 1:
+        col = present[0]
+        print(f"  [worker {worker_id}] device id source column: {col!r} (sole match)", flush=True)
+        return col
+    best = present[0]
+    best_n = -1
+    for batch in _iter_record_batches(dset, present, min(int(peek_batch_rows), 65_536)):
+        bpl = pl.from_arrow(batch)
+        if bpl.is_empty():
+            continue
+        for c in present:
+            nn = int(bpl[c].is_not_null().sum())
+            if nn > best_n:
+                best_n = nn
+                best = c
+        break
+    if best_n <= 0:
+        best = present[0]
+    print(
+        f"  [worker {worker_id}] device id source column: {best!r} (candidates={present!r}, "
+        f"non_null_in_peek_batch={best_n})",
+        flush=True,
+    )
+    return best
+
+
 def _rank_batch_topk(
     *,
     infer_df: pl.DataFrame,
-    device_id_col: str,
+    source_device_id_col: str,
+    output_device_id_col: str,
     user_cat_cols: list[str],
     user_num_cols: list[str],
     user_multi_cols: list[str],
@@ -135,7 +180,7 @@ def _rank_batch_topk(
     worker_id: int,
     forward_probe_state: dict[str, int] | None = None,
 ) -> pl.DataFrame:
-    device_ids = infer_df[device_id_col].to_numpy()
+    device_ids = infer_df[source_device_id_col].to_numpy()
     uc = _encode_cats_pl(infer_df, user_cat_cols, user_vocabs)
     un = _encode_nums_pl(infer_df, user_num_cols)
     um = _encode_multi_matrix_pl(infer_df, user_multi_cols, user_multi_vocabs, multi_max_tokens)
@@ -177,7 +222,8 @@ def _rank_batch_topk(
                     torch.cuda.synchronize()
                 elapsed_ms = (time.perf_counter() - t0) * 1000.0
                 print(
-                    f"[infer][worker={worker_id}] single_forward_ms={elapsed_ms:.3f} device_id={device_ids[i]}",
+                    f"[infer][worker={worker_id}] single_forward_ms={elapsed_ms:.3f} "
+                    f"{output_device_id_col}={device_ids[i]}",
                     flush=True,
                 )
             forward_probe_state["remaining"] = int(forward_probe_state.get("remaining", 0)) - probe_n
@@ -205,7 +251,7 @@ def _rank_batch_topk(
 
     return pl.DataFrame(
         {
-            device_id_col: np.repeat(device_ids, topk),
+            output_device_id_col: np.repeat(device_ids, topk),
             "client_id": client_ids_np[i_np.reshape(-1)],
             "score": s_np.reshape(-1),
             "rank": np.tile(np.arange(1, topk + 1, dtype=np.int32), bsz),
@@ -328,7 +374,8 @@ def tt_infer_worker(
     user_tower_uri: str,
     client_embeddings_uri: str,
     infer_ranking_output: str,
-    device_id_col: str,
+    device_id_candidates: list[str],
+    ranking_device_id_output_col: str,
     user_cat_cols: list[str],
     user_num_cols: list[str],
     user_multi_cols: list[str],
@@ -467,8 +514,14 @@ def tt_infer_worker(
             users_this_file = 0
 
             t0 = time.time()
+            source_device_id_col = _resolve_source_device_id_column(
+                parquet_path,
+                device_id_candidates,
+                infer_stream_batch_rows,
+                worker_id,
+            )
             dset = pads.dataset(parquet_path, format="parquet")
-            want = [device_id_col] + list(user_cat_cols) + list(user_num_cols) + list(user_multi_cols)
+            want = [source_device_id_col] + list(user_cat_cols) + list(user_num_cols) + list(user_multi_cols)
             cols = [c for c in want if c in dset.schema.names]
 
             seen: set[str] = set()
@@ -480,12 +533,12 @@ def tt_infer_worker(
                 t_read += time.time() - t0
                 t0 = time.time()
                 bpl = pl.from_arrow(batch)
-                bpl = bpl.unique(subset=[device_id_col], keep="first", maintain_order=False)
-                bpl = bpl.filter(~pl.col(device_id_col).cast(pl.Utf8).is_in(seen))
+                bpl = bpl.unique(subset=[source_device_id_col], keep="first", maintain_order=False)
+                bpl = bpl.filter(~pl.col(source_device_id_col).cast(pl.Utf8).is_in(seen))
                 if bpl.is_empty():
                     t0 = time.time()
                     continue
-                seen.update(bpl[device_id_col].cast(pl.Utf8).to_list())
+                seen.update(bpl[source_device_id_col].cast(pl.Utf8).to_list())
                 pending = pl.concat([pending, bpl], rechunk=False) if pending is not None else bpl
                 del bpl
                 t_prep += time.time() - t0
@@ -513,7 +566,8 @@ def tt_infer_worker(
                     t0 = time.time()
                     out_df = _rank_batch_topk(
                         infer_df=chunk,
-                        device_id_col=device_id_col,
+                        source_device_id_col=source_device_id_col,
+                        output_device_id_col=ranking_device_id_output_col,
                         user_cat_cols=user_cat_cols,
                         user_num_cols=user_num_cols,
                         user_multi_cols=user_multi_cols,
@@ -571,7 +625,8 @@ def tt_infer_worker(
                 if len(chunk) > 0:
                     out_df = _rank_batch_topk(
                         infer_df=chunk,
-                        device_id_col=device_id_col,
+                        source_device_id_col=source_device_id_col,
+                        output_device_id_col=ranking_device_id_output_col,
                         user_cat_cols=user_cat_cols,
                         user_num_cols=user_num_cols,
                         user_multi_cols=user_multi_cols,

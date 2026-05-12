@@ -28,7 +28,15 @@ def run_inference_job(cfg: InferJobConfig) -> None:
     user_cat_cols = list(vocab["user_cat_cols"])
     user_num_cols = list(vocab["user_num_cols"])
     user_multi_cols = list(vocab["user_multi_cols"])
-    device_id_col = str(vocab["device_id_col"])
+    vocab_device_id_col = str(vocab["device_id_col"])
+    device_id_candidates: list[str] = []
+    if cfg.infer_parquet_device_id_col is not None:
+        device_id_candidates.append(cfg.infer_parquet_device_id_col)
+    device_id_candidates.append(vocab_device_id_col)
+    for alt in ("device_id", "dev_id", "ifa", "advertising_id"):
+        if alt not in device_id_candidates:
+            device_id_candidates.append(alt)
+    ranking_device_id_out = str(cfg.infer.ranking_device_id_col)
     multi_max_tokens = int(vocab["multi_cat_max_tokens"])
 
     infer_files = list_parquet_inputs(cfg.paths.infer)
@@ -48,7 +56,10 @@ def run_inference_job(cfg: InferJobConfig) -> None:
 
     num_workers = max(1, int(ic.num_physical_gpus) * max(1, int(ic.workers_per_gpu)))
 
-    print(f"[infer] {num_workers} workers | {len(infer_files)} files | top-{ic.topk_clients}")
+    print(
+        f"[infer] {num_workers} workers | {len(infer_files)} files | top-{ic.topk_clients} | "
+        f"device_id candidates={device_id_candidates} -> output col={ranking_device_id_out!r}"
+    )
     if ic.max_files is not None or ic.max_users_per_file is not None:
         print(f"[infer] limits: max_files={ic.max_files} max_users_per_file={ic.max_users_per_file}")
     print(f"[infer] user tower: {arts['user_tower']}")
@@ -98,7 +109,8 @@ def run_inference_job(cfg: InferJobConfig) -> None:
                 arts["user_tower"],
                 arts["client_embeddings"],
                 out_prefix,
-                device_id_col,
+                device_id_candidates,
+                ranking_device_id_out,
                 user_cat_cols,
                 user_num_cols,
                 user_multi_cols,
