@@ -19,6 +19,8 @@ def run_inference_job(cfg: InferJobConfig) -> None:
     t_start = time.time()
     if ic.debug_cuda:
         os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+    if int(ic.pyarrow_io_threads) > 0:
+        os.environ["PYARROW_IO_THREADS"] = str(int(ic.pyarrow_io_threads))
 
     arts = training_artifact_uris(cfg.paths.artifacts_base)
     vocab = load_vocab_artifact_pickle(arts["vocab"])
@@ -68,7 +70,10 @@ def run_inference_job(cfg: InferJobConfig) -> None:
     runlog.write(
         f"CONFIG infer_path={cfg.paths.infer} artifacts_base={cfg.paths.artifacts_base} "
         f"out={out_prefix} files={len(infer_files)} topk={ic.topk_clients} "
-        f"max_files={ic.max_files} max_users_per_file={ic.max_users_per_file}"
+        f"max_files={ic.max_files} max_users_per_file={ic.max_users_per_file} "
+        f"device_id_candidates={device_id_candidates} ranking_device_id_col={ranking_device_id_out!r} "
+        f"(worker device-id resolution lines are echoed here from the parent process; "
+        f"child stdout may be hidden on SageMaker)"
     )
 
     # Jupyter/IPython notebooks + multiprocessing "spawn" can fail because the worker function
@@ -91,6 +96,9 @@ def run_inference_job(cfg: InferJobConfig) -> None:
     ctx = multiprocessing.get_context(start_method)
     file_queue = ctx.Queue()
     status_queue = ctx.Queue()
+    abort_event = ctx.Event()
+    guard_lock = ctx.Lock()
+    guard_stage = ctx.Value("i", 0)  # 0=unset, 1=passed, -1=failed (see worker guard)
 
     for fk in infer_files:
         file_queue.put(fk)
@@ -132,6 +140,13 @@ def run_inference_job(cfg: InferJobConfig) -> None:
                 ic.trt_fp16_enable,
                 ic.trt_engine_cache_enable,
                 ic.trt_engine_cache_path,
+                abort_event,
+                guard_lock,
+                guard_stage,
+                ic.device_id_output_guard_rows,
+                ic.device_id_output_guard_stop_job,
+                ic.pyarrow_io_threads,
+                ic.gc_every_n_rank_batches,
             ),
         )
         p.start()
@@ -144,6 +159,7 @@ def run_inference_job(cfg: InferJobConfig) -> None:
     last_hb = time.time()
     hb_every_s = 60.0
 
+    fatal_status: dict | None = None
     while completed < total:
         try:
             status = status_queue.get(timeout=30)
@@ -153,6 +169,9 @@ def run_inference_job(cfg: InferJobConfig) -> None:
                 runlog.write(f"HEARTBEAT completed_files={completed}/{total} elapsed_min={(now - start_time)/60:.1f}")
                 last_hb = now
             continue
+        if status.get("fatal_abort"):
+            fatal_status = status
+            break
         completed += 1
         if status.get("error"):
             errors.append(status)
@@ -163,11 +182,24 @@ def run_inference_job(cfg: InferJobConfig) -> None:
             total_read += float(status.get("read_time", 0))
             total_prep += float(status.get("preprocess_time", 0))
             total_inf += float(status.get("inference_time", 0))
+            src_col = status.get("device_id_source_col")
+            peek_nn = status.get("device_id_peek_nonnull")
+            peek_nr = status.get("device_id_peek_rows")
             runlog.write(
                 f"FILE_DONE ok=true file={status.get('file')} worker={status.get('worker')} users={status.get('users')} "
                 f"t_read={status.get('read_time',0):.2f} t_prep={status.get('preprocess_time',0):.2f} "
-                f"t_inf={status.get('inference_time',0):.2f} t_total={status.get('total_time',0):.2f}"
+                f"t_inf={status.get('inference_time',0):.2f} t_total={status.get('total_time',0):.2f} "
+                f"device_id_source_col={src_col} device_id_peek_nonnull={peek_nn} device_id_peek_rows={peek_nr}"
             )
+            if src_col is not None:
+                warn = peek_nn == 0 or peek_nn is None
+                if completed <= 5 or warn or completed % 200 == 0 or completed == total:
+                    print(
+                        f"[infer] file {completed}/{total} device_id_source_col={src_col!r} "
+                        f"peek_nonnull={peek_nn} peek_rows={peek_nr}"
+                        + ("  <<< WARNING: no non-null ids in peek batch" if warn else ""),
+                        flush=True,
+                    )
             if completed % 25 == 0 or completed == total:
                 elapsed = (time.time() - start_time) / 60
                 rate = completed / elapsed if elapsed > 0 else 0
@@ -176,6 +208,18 @@ def run_inference_job(cfg: InferJobConfig) -> None:
         if now - last_hb >= hb_every_s:
             runlog.write(f"HEARTBEAT completed_files={completed}/{total} elapsed_min={(now - start_time)/60:.1f}")
             last_hb = now
+
+    if fatal_status is not None:
+        err = str(fatal_status.get("error", "fatal_abort"))
+        runlog.write(f"FATAL_ABORT worker={fatal_status.get('worker')} file={fatal_status.get('file')} error={err}")
+        print(f"[infer][FATAL_ABORT] {err}", flush=True)
+        for p in processes:
+            if p.is_alive():
+                p.terminate()
+        for p in processes:
+            p.join(timeout=120)
+        runlog.write(f"FINISH ok=false fatal_abort elapsed_s={time.time()-t_start:.1f}")
+        raise RuntimeError(err)
 
     for p in processes:
         p.join()

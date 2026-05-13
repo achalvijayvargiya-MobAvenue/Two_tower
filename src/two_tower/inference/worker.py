@@ -111,16 +111,70 @@ def _encode_multi_matrix_pl(
     return torch.from_numpy(out)
 
 
+def _schema_lower_index(names: set[str]) -> dict[str, str]:
+    """Map lowercased column name -> first actual column name (case-insensitive match)."""
+    out: dict[str, str] = {}
+    for n in names:
+        k = n.lower()
+        if k not in out:
+            out[k] = n
+    return out
+
+
+def _heuristic_device_id_columns(names: set[str]) -> list[str]:
+    """Extra column names to consider when known candidates are missing or all-null."""
+    needles = (
+        "device_id",
+        "dev_id",
+        "advertising_id",
+        "advertisingid",
+        "idfa",
+        "gaid",
+        "ios_ifa",
+        "maid",
+        "oaid",
+    )
+    exclude = ("client", "bundle", "app_id", "package", "campaign", "creative", "line_item")
+    extras: list[str] = []
+    for n in sorted(names):
+        L = n.lower()
+        if any(nd in L for nd in needles) and not any(ex in L for ex in exclude):
+            extras.append(n)
+    return extras
+
+
 def _resolve_source_device_id_column(
+    dset: Any,
     parquet_path: str,
     candidates: list[str],
     peek_batch_rows: int,
     worker_id: int,
-) -> str:
-    """Pick which Parquet column holds the user/device id (handles dev_id vs device_id, null stubs)."""
-    dset = pads.dataset(parquet_path, format="parquet")
+    *,
+    verbose: bool = True,
+) -> tuple[str, int, int]:
+    """Pick which Parquet column holds the user/device id (handles dev_id vs device_id, null stubs).
+
+    ``dset`` must already be ``pyarrow.dataset.dataset(...)`` for ``parquet_path`` (single open).
+
+    Returns ``(column_name, non_null_count_in_peek, peek_row_count)``.
+    """
     names = set(dset.schema.names)
-    present = [c for c in candidates if c in names]
+    by_lower = _schema_lower_index(names)
+
+    def canon(c: str) -> str | None:
+        return by_lower.get(c.lower())
+
+    present: list[str] = []
+    for c in candidates:
+        a = canon(c)
+        if a is not None and a not in present:
+            present.append(a)
+
+    if not present:
+        for h in _heuristic_device_id_columns(names):
+            if h not in present:
+                present.append(h)
+
     if not present:
         sample = sorted(names)
         tail = " …" if len(sample) > 80 else ""
@@ -129,30 +183,109 @@ def _resolve_source_device_id_column(
             f"No device id column found in {parquet_path!r}. Tried {candidates!r}. "
             f"Schema has {len(names)} columns (sample): {sample}{tail}"
         )
-    if len(present) == 1:
-        col = present[0]
-        print(f"  [worker {worker_id}] device id source column: {col!r} (sole match)", flush=True)
-        return col
+
+    peek_rows = 0
     best = present[0]
     best_n = -1
     for batch in _iter_record_batches(dset, present, min(int(peek_batch_rows), 65_536)):
         bpl = pl.from_arrow(batch)
         if bpl.is_empty():
             continue
+        peek_rows = len(bpl)
         for c in present:
             nn = int(bpl[c].is_not_null().sum())
             if nn > best_n:
                 best_n = nn
                 best = c
         break
+
+    # Sole configured column but all null in peek: widen search to heuristic names in schema.
+    if best_n <= 0:
+        widen = [c for c in _heuristic_device_id_columns(names) if c in names and c not in present]
+        try_cols = present + widen
+        for batch in _iter_record_batches(dset, try_cols, min(int(peek_batch_rows), 65_536)):
+            bpl = pl.from_arrow(batch)
+            if bpl.is_empty():
+                continue
+            peek_rows = len(bpl)
+            for c in try_cols:
+                nn = int(bpl[c].is_not_null().sum())
+                if nn > best_n:
+                    best_n = nn
+                    best = c
+            break
+
     if best_n <= 0:
         best = present[0]
-    print(
-        f"  [worker {worker_id}] device id source column: {best!r} (candidates={present!r}, "
-        f"non_null_in_peek_batch={best_n})",
-        flush=True,
-    )
-    return best
+        best_n = 0
+
+    if verbose:
+        msg = (
+            f"  [worker {worker_id}] device id source column: {best!r} "
+            f"(considered={present!r}, non_null_in_peek={best_n}, peek_rows={peek_rows})"
+        )
+        print(msg, flush=True)
+        try:
+            print(msg, file=__import__("sys").stderr, flush=True)
+        except Exception:
+            pass
+    return best, int(best_n), int(peek_rows)
+
+
+def _ranking_output_device_ids_ok(sample: pl.Series) -> bool:
+    for v in sample.to_list():
+        if v is None:
+            return False
+        if isinstance(v, str) and not v.strip():
+            return False
+    return True
+
+
+def _job_first_ranking_device_id_guard(
+    *,
+    out_df: pl.DataFrame,
+    output_col: str,
+    guard_rows: int,
+    stop_job: bool,
+    abort_event: Any,
+    guard_lock: Any,
+    guard_stage: Any,
+    status_queue: Any,
+    worker_id: int,
+    parquet_path: str,
+) -> bool:
+    """Validate the first ranking rows job-wide. Return False if worker must exit (fatal already queued)."""
+    if guard_rows <= 0 or out_df.is_empty() or output_col not in out_df.schema:
+        return True
+    with guard_lock:
+        if int(guard_stage.value) == -1:
+            return False
+        if int(guard_stage.value) == 1:
+            return True
+        n = min(int(guard_rows), len(out_df))
+        sample = out_df[output_col].head(n)
+        if _ranking_output_device_ids_ok(sample):
+            guard_stage.value = 1
+            return True
+        msg = (
+            f"device_id_output_guard failed: first {n} rows of {output_col!r} contain null/blank "
+            f"(worker={worker_id} file={parquet_path!r})"
+        )
+        print(f"[infer][FATAL] {msg}", flush=True)
+        if not stop_job:
+            guard_stage.value = 1
+            return True
+        guard_stage.value = -1
+        abort_event.set()
+        status_queue.put(
+            {
+                "fatal_abort": True,
+                "worker": worker_id,
+                "file": parquet_path,
+                "error": msg,
+            }
+        )
+        return False
 
 
 def _rank_batch_topk(
@@ -180,7 +313,11 @@ def _rank_batch_topk(
     worker_id: int,
     forward_probe_state: dict[str, int] | None = None,
 ) -> pl.DataFrame:
-    device_ids = infer_df[source_device_id_col].to_numpy()
+    ids_utf8 = infer_df[source_device_id_col].cast(pl.Utf8, strict=False)
+    vals = ids_utf8.to_list()
+    arr = np.asarray(vals, dtype=object)
+    rep = np.repeat(arr, int(topk))
+    out_ids_series = pl.Series(output_device_id_col, rep, dtype=pl.Utf8)
     uc = _encode_cats_pl(infer_df, user_cat_cols, user_vocabs)
     un = _encode_nums_pl(infer_df, user_num_cols)
     um = _encode_multi_matrix_pl(infer_df, user_multi_cols, user_multi_vocabs, multi_max_tokens)
@@ -223,7 +360,7 @@ def _rank_batch_topk(
                 elapsed_ms = (time.perf_counter() - t0) * 1000.0
                 print(
                     f"[infer][worker={worker_id}] single_forward_ms={elapsed_ms:.3f} "
-                    f"{output_device_id_col}={device_ids[i]}",
+                    f"{output_device_id_col}={vals[i]!r}",
                     flush=True,
                 )
             forward_probe_state["remaining"] = int(forward_probe_state.get("remaining", 0)) - probe_n
@@ -251,7 +388,7 @@ def _rank_batch_topk(
 
     return pl.DataFrame(
         {
-            output_device_id_col: np.repeat(device_ids, topk),
+            output_device_id_col: out_ids_series,
             "client_id": client_ids_np[i_np.reshape(-1)],
             "score": s_np.reshape(-1),
             "rank": np.tile(np.arange(1, topk + 1, dtype=np.int32), bsz),
@@ -397,8 +534,17 @@ def tt_infer_worker(
     trt_fp16_enable: bool,
     trt_engine_cache_enable: bool,
     trt_engine_cache_path: str | None,
+    abort_event: Any,
+    guard_lock: Any,
+    guard_stage: Any,
+    device_id_guard_rows: int,
+    device_id_guard_stop_job: bool,
+    pyarrow_io_threads: int,
+    gc_every_n_rank_batches: int,
 ) -> None:
     """Multiprocessing worker: load tower + client matrix once, consume parquet paths from ``file_queue``."""
+    if int(pyarrow_io_threads) > 0:
+        os.environ["PYARROW_IO_THREADS"] = str(int(pyarrow_io_threads))
     os.environ["POLARS_MAX_THREADS"] = "2"
     try:
         pl.Config.set_num_threads(2)
@@ -485,6 +631,8 @@ def tt_infer_worker(
     out_prefix = infer_ranking_output
     # Log only the first few single-row forward passes to estimate baseline inference latency.
     forward_probe_state: dict[str, int] = {"remaining": 5}
+    rank_batches_done = 0
+    gc_every = max(1, int(gc_every_n_rank_batches))
 
     def _flush(force: bool = False) -> None:
         nonlocal part, out_buf, out_rows
@@ -505,6 +653,8 @@ def tt_infer_worker(
         item = file_queue.get()
         if item is None:
             break
+        if abort_event.is_set():
+            break
         parquet_path = item
         t_file = time.time()
         try:
@@ -514,13 +664,14 @@ def tt_infer_worker(
             users_this_file = 0
 
             t0 = time.time()
-            source_device_id_col = _resolve_source_device_id_column(
+            dset = pads.dataset(parquet_path, format="parquet")
+            source_device_id_col, peek_nonnull, peek_rows = _resolve_source_device_id_column(
+                dset,
                 parquet_path,
                 device_id_candidates,
                 infer_stream_batch_rows,
                 worker_id,
             )
-            dset = pads.dataset(parquet_path, format="parquet")
             want = [source_device_id_col] + list(user_cat_cols) + list(user_num_cols) + list(user_multi_cols)
             cols = [c for c in want if c in dset.schema.names]
 
@@ -589,12 +740,27 @@ def tt_infer_worker(
                         forward_probe_state=forward_probe_state,
                     )
                     t_inf += time.time() - t0
+                    if not _job_first_ranking_device_id_guard(
+                        out_df=out_df,
+                        output_col=ranking_device_id_output_col,
+                        guard_rows=int(device_id_guard_rows),
+                        stop_job=bool(device_id_guard_stop_job),
+                        abort_event=abort_event,
+                        guard_lock=guard_lock,
+                        guard_stage=guard_stage,
+                        status_queue=status_queue,
+                        worker_id=worker_id,
+                        parquet_path=parquet_path,
+                    ):
+                        return
                     out_buf.append(out_df)
                     out_rows += len(out_df)
                     users_this_file += len(chunk)
+                    rank_batches_done += 1
+                    if rank_batches_done % gc_every == 0:
+                        gc.collect()
                     _flush()
                     del out_df
-                    gc.collect()
                 t0 = time.time()
                 if max_users_per_file is not None and users_this_file >= int(max_users_per_file):
                     break
@@ -648,13 +814,27 @@ def tt_infer_worker(
                         forward_probe_state=forward_probe_state,
                     )
                     t_inf += time.time() - t0
+                    if not _job_first_ranking_device_id_guard(
+                        out_df=out_df,
+                        output_col=ranking_device_id_output_col,
+                        guard_rows=int(device_id_guard_rows),
+                        stop_job=bool(device_id_guard_stop_job),
+                        abort_event=abort_event,
+                        guard_lock=guard_lock,
+                        guard_stage=guard_stage,
+                        status_queue=status_queue,
+                        worker_id=worker_id,
+                        parquet_path=parquet_path,
+                    ):
+                        return
                     out_buf.append(out_df)
                     out_rows += len(out_df)
                     users_this_file += len(chunk)
+                    rank_batches_done += 1
+                    if rank_batches_done % gc_every == 0:
+                        gc.collect()
                     _flush()
                     del out_df
-                    gc.collect()
-
             status_queue.put(
                 {
                     "worker": worker_id,
@@ -665,6 +845,9 @@ def tt_infer_worker(
                     "inference_time": t_inf,
                     "total_time": time.time() - t_file,
                     "error": None,
+                    "device_id_source_col": source_device_id_col,
+                    "device_id_peek_nonnull": peek_nonnull,
+                    "device_id_peek_rows": peek_rows,
                 }
             )
         except Exception as e:

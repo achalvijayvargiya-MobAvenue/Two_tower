@@ -50,6 +50,10 @@ def _parse_inference_section(i: dict, *, path_label: str) -> InferenceConfig:
         if i.get("max_users_per_file") not in (None, "", 0)
         else None,
         ranking_device_id_col=str(i.get("ranking_device_id_col", "device_id")),
+        device_id_output_guard_rows=int(i.get("device_id_output_guard_rows", 32)),
+        device_id_output_guard_stop_job=bool(i.get("device_id_output_guard_stop_job", True)),
+        pyarrow_io_threads=int(i.get("pyarrow_io_threads", 8)),
+        gc_every_n_rank_batches=max(1, int(i.get("gc_every_n_rank_batches", 4))),
     )
 
 

@@ -135,6 +135,13 @@ class InferenceConfig:
 
     # Name of the device/user identifier column in ranking output Parquet (Athena-friendly).
     ranking_device_id_col: str = "device_id"
+    # First N rows of the *first* ranking batch job-wide: if any are null/blank, abort whole job.
+    device_id_output_guard_rows: int = 32
+    device_id_output_guard_stop_job: bool = True
+
+    # Throughput tuning (see infer.yaml comments).
+    pyarrow_io_threads: int = 8
+    gc_every_n_rank_batches: int = 4
 
 
 @dataclass(frozen=True)
